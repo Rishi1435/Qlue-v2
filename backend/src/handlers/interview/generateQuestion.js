@@ -16,22 +16,34 @@ function getAiPersona(voiceId) {
   return VOICE_PERSONA_MAP[voiceId] || 'Alex';
 }
 
-const IRRELEVANT_PATTERNS = [
-  /\b(weather|movie|game|sports|football|cricket|food|restaurant|hobby|pet|dog|cat)\b/i,
-  /\b(let me tell you a joke|funny story|by the way|random thought)\b/i,
+// Only these labels are treated as speaker/section prefixes worth stripping:
+// every persona the model can be given, the generic role names it sometimes
+// prepends, and the structural labels the prompts explicitly forbid but that
+// still leak through. Optionally wrapped in markdown bold and optionally
+// followed by a parenthesised role, e.g. "**Emma (Interviewer)**: ".
+// Anything else before a colon is real speech and must be left alone.
+const SPEAKER_LABELS = [
+  ...new Set([...Object.values(VOICE_PERSONA_MAP), 'Alex']),
+  'AI', 'Assistant', 'Interviewer', 'Tutor', 'Coach', 'Qlue',
+  'Question', 'Response', 'Answer', 'Acknowledgment', 'Acknowledgement', 'Feedback'
 ];
+const SPEAKER_LABEL_REGEX = new RegExp(
+  `^\\*{0,2}(?:${SPEAKER_LABELS.join('|')})(?:\\s*\\([^)]*\\))?\\*{0,2}:\\s*`,
+  'i'
+);
 
+// PERF-FIX #2: Removed keyword-blocklist relevance detection. The old regex
+// flagged legitimate answers as off-topic (e.g. "I built a sports analytics
+// dashboard", or a game developer describing their work), and any answer under
+// 5 words (e.g. "Yes, exactly right") was marked irrelevant. Topic-steering is
+// now delegated to the LLM via a standing rule inside each prompt, which can
+// judge context instead of keywords. We keep a minimal length heuristic only
+// to nudge for elaboration on extremely short answers.
 function analyzeResponseRelevance(transcript) {
   if (!transcript || transcript.trim() === '') return { isRelevant: true, issue: null };
-  
-  const wordCount = transcript.trim().split(/\s+/).length;
-  if (wordCount < 5) return { isRelevant: false, issue: 'too_short' };
 
-  for (const pattern of IRRELEVANT_PATTERNS) {
-    if (pattern.test(transcript)) {
-      return { isRelevant: false, issue: 'irrelevant_topic' };
-    }
-  }
+  const wordCount = transcript.trim().split(/\s+/).length;
+  if (wordCount < 3) return { isRelevant: false, issue: 'too_short' };
 
   return { isRelevant: true, issue: null };
 }
@@ -41,6 +53,9 @@ function analyzeResponseRelevance(transcript) {
 // =============================================================================
 function extractResumeSummary(resumeData) {
   if (!resumeData) return 'No resume data available.';
+  // PERF-FIX #5: sessions now snapshot a pre-extracted summary string at
+  // initialization; pass it through untouched.
+  if (typeof resumeData === 'string') return resumeData;
   const r = resumeData.parsedData || resumeData;
 
   const name = r.name || r.fullName || 'Candidate';
@@ -137,6 +152,9 @@ ${summary}
 5. NEVER ask multiple questions at once.
 6. NEVER repeat questions from the history.
 7. Keep your total response maximum 3 short sentences to ensure natural spoken pacing.
+8. If the candidate's last answer drifted away from professional/interview topics, use your acknowledgment to politely steer them back before asking your question.
+9. If the candidate's last answer was COMPLETELY unrelated to the interview (personal chatter, random topics, refusing to engage), begin your ENTIRE response with the exact marker [OFFTOPIC] and use your acknowledgment to clearly warn them that the interview will end if they continue going off-topic.
+10. IMPORTANT: The candidate's answers arrive via speech-to-text and may contain mis-transcribed technical terms (e.g. "flitter std" for "Flutter STT", "tax" for "text"). Infer the intended words from context; never quote or correct transcription artifacts.
 </response_rules>
 
 <conversation_history>
@@ -158,7 +176,12 @@ function buildWebsiteTeachPrompt(websiteContent, targetConcept, turnIndex, conve
   return `You are ${aiName}, an expert Tutor from Qlue.
 
 <source_material>
-${websiteContent?.substring(0, 1500) || 'Content not available'}
+${websiteContent?.substring(0, 5000) || 'Content not available'}
+
+STRICT GROUNDING RULES:
+- Ask ONLY about concepts, facts, and terminology that actually appear in the content above.
+- NEVER invent questions about topics the content does not cover; if the content is thin, ask the student to explain or apply something it DOES contain.
+- IMPORTANT: The candidate's answers arrive via speech-to-text and may contain mis-transcribed technical terms (e.g. "flitter std" for "Flutter STT", "tax" for "text"). Infer the intended words from context; never quote or correct transcription artifacts.
 </source_material>
 
 <core_personality>
@@ -191,6 +214,68 @@ Respond with ONLY what ${aiName} says using the || format.`;
  * AI acts as an HR interviewer asking situational and behavioral questions.
  * Warm but professional, focused on culture fit and teamwork.
  */
+function buildJdPrompt(resumeData, jdSummary, turnIndex, conversationHistory = [], aiName = 'Emma', relevance = null) {
+  const resumeSummary = extractResumeSummary(resumeData);
+  const historyText = conversationHistory.length > 0
+    ? conversationHistory.map(t => `${t.speaker}: ${t.text}`).join('\n')
+    : 'No previous conversation.';
+
+  let relevanceNote = '';
+  if (relevance && !relevance.isRelevant && relevance.issue === 'too_short') {
+    relevanceNote = '\nNOTE: The candidate\'s last answer was very brief. Gently encourage them to elaborate before moving on.';
+  }
+
+  if (turnIndex === 0) {
+    return `You are ${aiName}, a professional interviewer screening a candidate for a specific job opening.
+
+<job_description>
+${jdSummary || 'A technical role.'}
+</job_description>
+
+<candidate_resume>
+${resumeSummary}
+</candidate_resume>
+
+<task>
+Greet the candidate warmly by role (do not use their name), mention the position you are interviewing them for in one short phrase, and ask ONE opening question that connects their background to a core requirement of this job.
+</task>
+
+<response_rules>
+1. Format your response EXACTLY as: [Greeting] || [Question]
+2. Keep your total response maximum 3 short sentences for natural spoken pacing.
+3. Speak plainly and conversationally; no markdown, lists, or stage directions.
+</response_rules>`;
+  }
+
+  return `You are ${aiName}, a professional interviewer screening a candidate for a specific job opening.
+
+<job_description>
+${jdSummary || 'A technical role.'}
+</job_description>
+
+<candidate_resume>
+${resumeSummary}
+</candidate_resume>
+
+<conversation_history>
+${historyText}
+</conversation_history>
+${relevanceNote}
+<task>
+Acknowledge the candidate's last answer in one short sentence, then ask ONE follow-up question. Prioritize probing the job's core requirements — especially areas where the resume and job description differ — over generic questions.
+</task>
+
+<response_rules>
+1. Format your response EXACTLY as: [Acknowledgment] || [Question]
+2. Base your follow-up on their previous answer and the job requirements.
+3. NEVER repeat questions from the history.
+4. Keep your total response maximum 3 short sentences.
+5. If the candidate's last answer drifted off-topic, use your acknowledgment to politely steer them back before asking your question.
+6. If the candidate's last answer was COMPLETELY unrelated to the interview (personal chatter, random topics, refusing to engage), begin your ENTIRE response with the exact marker [OFFTOPIC] and use your acknowledgment to clearly warn them that the interview will end if they continue going off-topic.
+7. IMPORTANT: The candidate's answers arrive via speech-to-text and may contain mis-transcribed technical terms (e.g. "flitter std" for "Flutter STT", "tax" for "text"). Infer the intended words from context; never quote or correct transcription artifacts.
+</response_rules>`;
+}
+
 function buildHrPrompt(userData, turnIndex, conversationHistory = [], aiName = 'Emma', relevance = null) {
   const historyText = formatConversationHistory(conversationHistory, aiName);
   const isFirstTurn = turnIndex === 0;
@@ -226,6 +311,9 @@ ${userData?.currentRole ? `Current Role: ${userData.currentRole}` : ''}
 3. Ask exactly ONE engaging behavioral or situational question (teamwork, culture fit, conflict resolution, leadership, handling pressure).
 4. Base your follow-up heavily on their previous answer.
 5. Keep your total response maximum 3 short sentences.
+6. If the candidate's last answer drifted off-topic, use your reaction to politely steer them back before asking your question.
+7. If the candidate's last answer was COMPLETELY unrelated to the interview (personal chatter, random topics, refusing to engage), begin your ENTIRE response with the exact marker [OFFTOPIC] and use your acknowledgment to clearly warn them that the interview will end if they continue going off-topic.
+8. IMPORTANT: The candidate's answers arrive via speech-to-text and may contain mis-transcribed technical terms (e.g. "flitter std" for "Flutter STT", "tax" for "text"). Infer the intended words from context; never quote or correct transcription artifacts.
 </response_rules>
 
 <conversation_history>
@@ -266,10 +354,10 @@ ${historyText || '(This is the beginning of the session)'}
 
 <turn_instruction>
 ${isFirstTurn 
-  ? 'Directly ask the candidate: "Tell me about yourself." No small talk, no casual greetings, no filler.' 
+  ? 'Directly ask the candidate: \"Tell me about yourself.\" No small talk, no casual greetings, no filler.' 
   : (turnIndex === 1 
-      ? 'Analyze their introduction carefully. Give ONE highly specific, constructive tip on what they should include or improve (e.g., "Add your years of experience", "Mention a key achievement with metrics", "Connect your background to the target role"). Then ask ONE follow-up question to help them refine their intro.' 
-      : 'Continue coaching. Dig deeper into a specific aspect of their introduction. Either suggest another missing element, ask them to rephrase a weak part, or have them practice a specific component (e.g., opening hook, closing statement).')}
+      ? 'STAGE 2 - VERBAL FEEDBACK: Analyze their introduction carefully. Give your feedback OUT LOUD right now: name the strongest part of their intro, then the 1-2 most important things to ADD or improve (e.g., \"Add your years of experience\", \"Mention a key achievement with metrics\", \"Connect your background to the target role\"). Then ask them to deliver their improved introduction incorporating your feedback.' 
+      : 'STAGE 3 - CLOSING: They have just delivered their improved introduction. In one sentence, tell them the most noticeable improvement compared to their first attempt. Then close warmly: tell them the session is complete and their detailed score and report are being prepared. Do NOT ask another question.')}
 </turn_instruction>
 
 Respond with ONLY what ${aiName} says using the || format.`;
@@ -281,6 +369,15 @@ Respond with ONLY what ${aiName} says using the || format.`;
 function cleanAIResponse(rawText) {
   if (!rawText) return '';
   let cleaned = rawText.trim();
+
+  // BUG FIX (3-strike system was dead): the stage-direction stripper below
+  // removes anything in square brackets, which silently ate the [OFFTOPIC]
+  // marker. Because generateQuestion returns the already-cleaned text, the
+  // asyncWorker's `aiText.includes('[OFFTOPIC]')` check could never be true and
+  // no strike was ever recorded. Lift the marker out here and re-attach it
+  // after cleaning so the worker can still see it.
+  const wasOffTopic = /\[OFFTOPIC\]/i.test(cleaned);
+  if (wasOffTopic) cleaned = cleaned.replace(/\[OFFTOPIC\]/gi, ' ');
 
   try {
     const parsed = JSON.parse(cleaned);
@@ -298,8 +395,13 @@ function cleanAIResponse(rawText) {
   }
 
   cleaned = cleaned
-    .replace(/^(.*?):\s*/i, '') // Remove any prefix like "Emma:" or "Interviewer:"
-    .replace(/^\*\*.*?\*\*:\s*/, '')
+    // BUG FIX: this used to be /^(.*?):\s*/ — an unbounded match that deleted
+    // everything before the FIRST colon anywhere in the first line. Legitimate
+    // speech like "My next question: what trade-offs did you weigh?" was
+    // truncated to "what trade-offs did you weigh?", and a line mentioning a
+    // time ("we deploy at 9:00") lost its opening clause. Only a known speaker
+    // label is stripped now.
+    .replace(SPEAKER_LABEL_REGEX, '')
     .replace(/^["']|["']$/g, '')
     .trim();
 
@@ -308,7 +410,8 @@ function cleanAIResponse(rawText) {
                    .replace(/\s*\[[^\]]*\]\s*/g, ' ')
                    .replace(/\s*\{[^}]*\}\s*/g, ' ');
 
-  return cleaned.replace(/\s+/g, ' ').trim();
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+  return wasOffTopic ? `[OFFTOPIC] ${cleaned}` : cleaned;
 }
 
 // =============================================================================
@@ -317,7 +420,7 @@ function cleanAIResponse(rawText) {
 exports.handler = async (event) => {
   try {
     const body = typeof event.body === 'string' ? JSON.parse(event.body || '{}') : (event.body || {});
-    const { sessionId, moduleType, resumeData, websiteContent, targetConcept, userData, turnIndex, conversationHistory, voiceId, currentDimension } = body;
+    const { sessionId, moduleType, resumeData, jdSummary, websiteContent, targetConcept, userData, turnIndex, conversationHistory, voiceId, currentDimension, isFinalTurn } = body;
 
     const aiName = getAiPersona(voiceId);
 
@@ -330,12 +433,35 @@ exports.handler = async (event) => {
     const relevance = analyzeResponseRelevance(userLatestTranscript);
 
     let prompt;
+    // WRAP-UP: when the turn cap is reached, deliver a natural closing
+    // statement instead of yet another question.
+    if (isFinalTurn && ['RESUME', 'HR', 'JD', 'WEBSITE'].includes(moduleType)) {
+      const historyText = (conversationHistory || []).map(t => `${t.speaker}: ${t.text}`).join('\n');
+      prompt = `You are ${aiName}, a professional interviewer concluding an interview session.
+
+<conversation_history>
+${historyText || '(none)'}
+</conversation_history>
+
+<task>
+The interview is now complete. Briefly acknowledge the candidate's final answer, then deliver a warm closing: thank them for their time, mention ONE genuine positive from the conversation, and tell them their detailed feedback report is being prepared.
+</task>
+
+<response_rules>
+1. Format EXACTLY as: [Acknowledgment] || [Closing statement]
+2. Do NOT ask any question. Maximum 3 short sentences total.
+3. IMPORTANT: The candidate's answers arrive via speech-to-text and may contain mis-transcribed technical terms (e.g. "flitter std" for "Flutter STT", "tax" for "text"). Infer the intended words from context; never quote or correct transcription artifacts.
+</response_rules>`;
+    } else {
     switch (moduleType) {
       case 'WEBSITE':
         prompt = buildWebsiteTeachPrompt(websiteContent, targetConcept, turnIndex, conversationHistory, aiName);
         break;
       case 'HR':
         prompt = buildHrPrompt(userData, turnIndex, conversationHistory, aiName, relevance);
+        break;
+      case 'JD':
+        prompt = buildJdPrompt(resumeData, jdSummary, turnIndex, conversationHistory, aiName, relevance);
         break;
       case 'INTRO':
         prompt = buildIntroPrompt(turnIndex, conversationHistory, aiName);
@@ -344,6 +470,7 @@ exports.handler = async (event) => {
       default:
         prompt = buildInterviewPrompt(resumeData, turnIndex, conversationHistory, aiName, relevance, currentDimension || 'their past experience');
         break;
+    }
     }
 
     let rawResponse = '';
@@ -385,6 +512,7 @@ exports.handler = async (event) => {
 module.exports = {
   handler: exports.handler,
   buildInterviewPrompt,
+  buildJdPrompt,
   buildWebsiteTeachPrompt,
   buildHrPrompt,
   buildIntroPrompt,

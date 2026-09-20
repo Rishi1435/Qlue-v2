@@ -27,7 +27,7 @@ async function createSession(sessionId, userId, moduleType, itemData = {}) {
         moduleType,
         itemData,
         voiceId: itemData.voiceId || 'Tiffany',
-        engine: itemData.engine || 'generative',
+        engine: itemData.engine || 'neural',
         currentState: INTERVIEW_STATES.INITIALIZING,
         turnCount: 0,
         startedAt: nowMs,     // Numeric — matches GSI_UserIdStartedAt type N
@@ -151,6 +151,19 @@ async function updateSessionState(sessionId, newState, expectedCurrentState = nu
     updateExpression += ", updatedAt = :updatedAt";
     expressionAttributeValues[":updatedAt"] = new Date().toISOString();
     
+    // 3-STRIKE SYSTEM: persist the off-topic counter (updateSessionState is
+    // whitelist-based; without this entry the count silently never advanced).
+    if (updates.offTopicStrikes !== undefined) {
+        updateExpression += ", offTopicStrikes = :offTopicStrikes";
+        expressionAttributeValues[":offTopicStrikes"] = updates.offTopicStrikes;
+    }
+
+    // DISCARD FIX: flag sessions ended with zero user answers.
+    if (updates.discarded !== undefined) {
+        updateExpression += ", discarded = :discarded";
+        expressionAttributeValues[":discarded"] = updates.discarded;
+    }
+
     if (updates.silenceRetries !== undefined) {
         updateExpression += ", silenceRetries = :silenceRetries";
         expressionAttributeValues[":silenceRetries"] = updates.silenceRetries;

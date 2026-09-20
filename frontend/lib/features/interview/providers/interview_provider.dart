@@ -29,14 +29,25 @@ class InterviewProvider extends ChangeNotifier {
   List<TranscriptEntry> transcript = [];
   String? errorMessage;
   String _selectedVoiceId = 'Tiffany';
-  String _selectedEngine = 'generative';
+  // COST: must match the backend default (POLLY_DEFAULT_ENGINE, 'neural').
+  // The backend overrides whatever the client sends, so 'generative' here was
+  // only ever misleading — but if the override is relaxed it would silently
+  // double the Polly bill ($30 vs $16 per 1M chars).
+  String _selectedEngine = 'neural';
+
+  // 'cost_saver' (neural) or 'premium' (generative). Drives which engine the
+  // backend is allowed to use for Polly synthesis.
+  String _voiceMode = 'cost_saver';
 
   String get selectedVoiceId => _selectedVoiceId;
   String get selectedEngine => _selectedEngine;
+  String get voiceMode => _voiceMode;
 
-  void setVoice(String voiceId, {String engine = 'generative'}) {
+  void setVoice(String voiceId, {String? engine, String voiceMode = 'cost_saver'}) {
     _selectedVoiceId = voiceId;
-    _selectedEngine = engine;
+    _voiceMode = voiceMode;
+    // Engine follows the mode unless explicitly overridden.
+    _selectedEngine = engine ?? (voiceMode == 'premium' ? 'generative' : 'neural');
     _safeNotify();
   }
 
@@ -52,6 +63,7 @@ class InterviewProvider extends ChangeNotifier {
   bool isSessionEnded = false;
   int _silenceStrikes = 0;
   int get silenceStrikes => _silenceStrikes;
+  int _sttRetryCount = 0;
 
   WebSocketClient? _wsClient;
   final SttService _sttService = SttService();
@@ -185,7 +197,29 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
     }
   }
 
+  // GLITCH FIX (self-intro cutoff): the server sends 'termination' right
+  // after the final turn's audio starts playing. Cleaning up immediately
+  // stopped the player, so the closing message appeared as text but was
+  // never spoken. If audio is playing, defer finalization until playback
+  // completes (the playback .then always routes through _startListening,
+  // which finalizes below); a 30s safety timer guarantees we never hang.
+  bool _pendingTermination = false;
+
   void _handleTermination() {
+    _isEnding = true;
+    _sttService.stop();
+    if (_currentPhase == InterviewPhase.speaking) {
+      _pendingTermination = true;
+      Future.delayed(const Duration(seconds: 30), () {
+        if (_pendingTermination) _finalizeTermination();
+      });
+      return;
+    }
+    _finalizeTermination();
+  }
+
+  void _finalizeTermination() {
+    _pendingTermination = false;
     isSessionEnded = true;
     _currentPhase = InterviewPhase.ready;
     _cleanup();
@@ -200,8 +234,20 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
 
   Timer? _safetyTimer;
   
+  // FE-BUG FIX (mic after end): when the user ends a session while the AI is
+  // speaking, the pending audio-playback .then()/.catchError() callbacks fire
+  // AFTER cleanup and call _startListening(), turning the mic back on. This
+  // flag is set synchronously the moment ending begins and blocks every
+  // listening entry point.
+  bool _isEnding = false;
+
   void _startListening() {
-    if (isListening) return;
+    if (_isEnding || isSessionEnded) {
+      debugPrint('STT: session ending/ended — refusing to start listening');
+      if (_pendingTermination) _finalizeTermination(); // closing audio just finished
+      return;
+    }
+    if (isListening && _sttService.isListening) return;
     
     // Cancel any pending safety timer from previous turn
     _safetyTimer?.cancel();
@@ -215,6 +261,7 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
       onFinal: (text) {
         finalTranscript = text;
         isListening = false;
+        _sttRetryCount = 0; // Reset on success
         _safetyTimer?.cancel(); // Cancel safety timer on successful completion
         if (text.isEmpty) {
           _silenceStrikes++;
@@ -224,18 +271,54 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
         _submitResponse(text);
         _safeNotify();
       },
+      onError: (error) {
+        debugPrint('Provider STT Error: ${error.errorMsg}');
+        _handleSttFailure();
+      },
+      onStatus: (status) {
+        if (status == 'done' && isListening) {
+          // If native engine stopped but we haven't received a final result yet
+          debugPrint('Provider STT status: done (still in listening phase)');
+          _handleSttFailure();
+        }
+      },
     );
 
-    // Safety timeout - force submit if onFinal never fires
-    _safetyTimer = Timer(const Duration(seconds: 35), () {
-      if (isListening && !_sttService.isListening) {
-        // STT stopped without calling onFinal — force submit
-        debugPrint('STT timeout: forcing submit after silence');
+    // Safety timeout - force submit if onFinal never fires and retry logic fails
+    _safetyTimer = Timer(const Duration(seconds: 40), () {
+      if (isListening) {
+        debugPrint('STT Absolute timeout: forcing submit');
         isListening = false;
-        _submitResponse('');
+        _submitResponse(partialTranscript);
         _safeNotify();
       }
     });
+  }
+
+  void _handleSttFailure() async {
+    if (!isListening) return;
+
+    if (_sttRetryCount < 2) {
+      _sttRetryCount++;
+      debugPrint('Retrying STT (Attempt $_sttRetryCount)...');
+      
+      // Briefly stop and wait before retrying to let engine clear
+      _sttService.stop();
+      await Future.delayed(const Duration(milliseconds: 500));
+      
+      // If first retry failed, try re-initializing
+      if (_sttRetryCount == 2) {
+        await _sttService.reInitialize();
+      }
+      
+      _startListening();
+    } else {
+      debugPrint('STT failed after retries, submitting partial or empty response.');
+      isListening = false;
+      _sttRetryCount = 0;
+      _submitResponse(partialTranscript);
+      _safeNotify();
+    }
   }
 
   void _submitResponse(String text) {
@@ -253,6 +336,7 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
         'isSilence': text.isEmpty,
         'voiceId': _selectedVoiceId,
         'engine': _selectedEngine,
+        'voiceMode': _voiceMode,
       },
     });
   }
@@ -269,6 +353,7 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
   // Additional methods for screen compatibility
   void resetForNewSession() {
     _cleanup();
+    _isEnding = false;
     _isInitializing = false;
     isSessionEnded = false;
     isConnecting = true;
@@ -329,6 +414,7 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
         'moduleType': moduleType,
         'voiceId': _selectedVoiceId,
         'engine': _selectedEngine,
+        'voiceMode': _voiceMode,
         'resumeId': resumeId,
         'websiteUrl': websiteUrl,
       });
@@ -380,6 +466,7 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
         'moduleType': moduleType,
         'voiceId': _selectedVoiceId,
         'engine': _selectedEngine,
+        'voiceMode': _voiceMode,
         'resumeId': resumeId,
         'websiteUrl': websiteUrl,
       },
@@ -396,11 +483,19 @@ void _handleTurnComplete(Map<String, dynamic> payload) {
   // which prevents the feedback screen navigation guard from ever firing.
   Future<void> endSession() async {
     if (isSessionEnded) return;
+    _isEnding = true;          // block any pending _startListening callbacks
+    _sttService.stop();        // and silence the mic immediately
     final savedSessionId = sessionId;
     terminateSession();
     if (savedSessionId != null) {
       try {
-        await DioClient().dio.post('${ApiConstants.interviewInit}/$savedSessionId/terminate');
+        // BUG FIX: this posted to '/interview/init/<id>/terminate', a route the
+        // API does not define — API Gateway answered 403 every time, so the
+        // REST safety net behind the WebSocket terminate never actually ran.
+        await DioClient().dio.post(
+          ApiConstants.interviewTerminate,
+          data: {'sessionId': savedSessionId, 'reason': 'USER_INITIATED'},
+        );
       } catch (e) {
         debugPrint('REST terminate failed: $e');
       }

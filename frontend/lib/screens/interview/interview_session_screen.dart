@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:frontend/context/auth_provider.dart';
+import 'package:frontend/context/appearance_provider.dart';
 import 'package:go_router/go_router.dart';
 import 'dot_matrix_painter.dart';
 import '../../core/theme.dart';
@@ -82,7 +83,11 @@ class _InterviewSessionScreenState extends State<InterviewSessionScreen> with Ti
         if (!mounted) return;
         setState(() => _time += 0.016);
       });
-    _animationController.repeat();
+    // Reduce-motion (Profile -> Appearance) freezes the ambient dot-matrix
+    // animation; the bubble still renders its liquid-glass dots statically.
+    if (!context.read<AppearanceProvider>().reduceMotion) {
+      _animationController.repeat();
+    }
 
     _intensityController = AnimationController(
       vsync: this,
@@ -105,23 +110,23 @@ class _InterviewSessionScreenState extends State<InterviewSessionScreen> with Ti
     };
     _provider.addListener(_providerListener);
 
-    // CRITICAL: Reset + init deferred to post-frame so notifyListeners() is
-    // never called while the widget tree is still being built (avoids the
-    // "setState() called during build" assertion).
+    // Reset provider immediately to prevent redirect from old session state in the first build
+    _provider.resetForNewSession();
+
+    // Init deferred to post-frame to ensure any async side-effects or further notifications 
+    // happen safely after the initial build.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
 
-      // Reset provider to prevent redirect from old session state
-      _provider.resetForNewSession();
-
       final type = widget.moduleType ?? (widget.resumeId != null ? 'RESUME' : (widget.websiteUrl != null ? 'WEBSITE' : 'HR'));
-      if (!(type == 'RESUME' || type == 'HR' || type == 'WEBSITE' || type == 'INTRO')) {
+      if (!(type == 'RESUME' || type == 'HR' || type == 'WEBSITE' || type == 'INTRO' || type == 'JD')) {
         throw ArgumentError('Invalid moduleType');
       }
 
-      // Fetch the auth provider to get the selected voice
+      // Fetch the auth provider to get the selected voice + mode. Premium mode
+      // uses generative voices; cost-saver stays on the cheaper neural engine.
       final authProvider = context.read<AuthProvider>();
-      _provider.setVoice(authProvider.voiceId, engine: 'generative');
+      _provider.setVoice(authProvider.voiceId, voiceMode: authProvider.voiceMode);
 
       _provider.initSession(
         type,
@@ -174,8 +179,9 @@ class _InterviewSessionScreenState extends State<InterviewSessionScreen> with Ti
     _isSimulating = true;
     
     Future.doWhile(() async {
+      if (!mounted) return false;
       final currentPhase = context.read<InterviewProvider>().currentPhase;
-      if (!mounted || _isDisposed || (currentPhase != InterviewPhase.speaking && currentPhase != InterviewPhase.listening)) {
+      if (_isDisposed || (currentPhase != InterviewPhase.speaking && currentPhase != InterviewPhase.listening)) {
         _isSimulating = false;
         return false;
       }

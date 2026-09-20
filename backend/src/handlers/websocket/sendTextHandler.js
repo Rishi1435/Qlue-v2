@@ -2,7 +2,11 @@ const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { getSession, getSessionById, updateSessionState, INTERVIEW_STATES } = require('../../models/session');
 const { getTranscriptBySession, getLatestTranscripts } = require('../../models/transcript');
-const { deregisterConnection } = require('../../lib/websocket');
+// BUG FIX: postToConnection was used throughout this handler but never
+// imported, so every pong / turn_error / reconnect reply threw a silent
+// ReferenceError inside try/catch blocks and never reached the client.
+const { postToConnection, deregisterConnection } = require('../../lib/websocket');
+const { getConnection } = require('../../models/wsConnection');
 const { docClient } = require('../../lib/dynamodb');
 
 const sqsClient = new SQSClient({ region: process.env.AWS_REGION || 'us-east-1' });
@@ -40,6 +44,21 @@ async function updateConnectionHeartbeat(connectionId) {
   }
 }
 
+/**
+ * Resolve the voice mode + engine for a turn. The client may pass voiceMode on
+ * each message (so a user can switch mid-session); otherwise fall back to what
+ * the session was created with. 'premium' -> generative, 'cost_saver' -> neural.
+ */
+function resolveVoiceMode(session, body) {
+  const requested = body?.voiceMode;
+  const stored = session?.itemData?.voiceMode || session?.voiceMode;
+  const voiceMode = (requested === 'premium' || requested === 'cost_saver')
+    ? requested
+    : (stored === 'premium' ? 'premium' : 'cost_saver');
+  const engine = voiceMode === 'premium' ? 'generative' : 'neural';
+  return { voiceMode, engine };
+}
+
 async function getLastAiTurnIndex(sessionId, sessionTurnCount = 0) {
   try {
     const transcripts = await getLatestTranscripts(sessionId, 5);
@@ -74,9 +93,12 @@ async function handleSessionInit(connectionId, body, userId) {
 
     const allowedVoices = (process.env.ALLOWED_VOICES || 'Tiffany,Ruth,Joanna,Matthew,Stephen').split(',');
     const finalVoiceId = allowedVoices.includes(voiceId) ? voiceId : (session.voiceId || 'Tiffany');
-    
-    // Force generative engine universally
-    const finalEngine = 'generative';
+
+    // VOICE MODE: the session was created with a voiceMode ('premium' unlocks
+    // generative voices, 'cost_saver' stays on neural). The engine follows from
+    // the mode; lib/polly.js still validates the (voice, engine) pair and
+    // enforces the generative opt-in.
+    const { voiceMode: finalVoiceMode, engine: finalEngine } = resolveVoiceMode(session, body);
     // Do not advance session state here; asyncWorker owns session initialization state transitions.
 
     // BUG-4 FIX: Use UpdateCommand with attribute_not_exists to prevent overwrite race
@@ -112,11 +134,12 @@ async function handleSessionInit(connectionId, body, userId) {
         userId,   // BE-BUG #17 FIX: pass userId so asyncWorker can call handlers with ownership context
         action: 'session_init',
         voiceId: finalVoiceId,
-        engine: finalEngine
+        engine: finalEngine,
+        voiceMode: finalVoiceMode
       })
     }));
 
-    console.log(`[session_init] Queued for ${sessionId} with voice ${finalVoiceId}`);
+    console.log(`[session_init] Queued for ${sessionId} with voice ${finalVoiceId} (${finalVoiceMode})`);
 
   } catch (err) {
     console.error('session_init error:', err);
@@ -137,6 +160,14 @@ async function handleTurnSubmit(connectionId, body, userId) {
     if (!session || session.currentState === INTERVIEW_STATES.TERMINATED) {
       return await sendError(connectionId, 'Session is terminated');
     }
+
+    // Ownership is checked before any state is reported back, so probing an
+    // arbitrary sessionId cannot reveal whether it exists or what state it is
+    // in. (The check used to sit below the state branches.)
+    if (session.userId !== userId) {
+      return await sendError(connectionId, 'Forbidden: Session does not belong to this user', 403);
+    }
+
     if (session.currentState === INTERVIEW_STATES.GENERATING_FEEDBACK) {
       await postToConnection(connectionId, { 
         type: 'termination', 
@@ -146,11 +177,6 @@ async function handleTurnSubmit(connectionId, body, userId) {
     }
     if (session.currentState === INTERVIEW_STATES.PROCESSING_RESPONSE || session.currentState === INTERVIEW_STATES.AI_SPEAKING) {
       return await sendError(connectionId, 'TURN_IN_PROGRESS', 409);
-    }
-
-    // BUG-2 FIX: Validate session ownership
-    if (session.userId !== userId) {
-      return await sendError(connectionId, 'Forbidden: Session does not belong to this user', 403);
     }
 
     // BUG-3 FIX: Make state update atomic - only update if currently USER_RESPONDING
@@ -169,11 +195,11 @@ async function handleTurnSubmit(connectionId, body, userId) {
 
     const allowedVoices = (process.env.ALLOWED_VOICES || 'Tiffany,Ruth,Joanna,Matthew,Stephen').split(',');
     const finalVoiceId = allowedVoices.includes(voiceId) ? voiceId : (session.voiceId || 'Tiffany');
-    
-    // Force generative engine universally
-    const finalEngine = 'generative';
 
-    console.log(`[turn_submit] Session ${sessionId} | Voice: ${finalVoiceId} | Engine: ${finalEngine}`);
+    // COST-FIX / VOICE MODE: see session_init note above.
+    const { voiceMode: finalVoiceMode, engine: finalEngine } = resolveVoiceMode(session, body);
+
+    console.log(`[turn_submit] Session ${sessionId} | Voice: ${finalVoiceId} | Engine: ${finalEngine} (${finalVoiceMode})`);
 
     await sqsClient.send(new SendMessageCommand({
       QueueUrl: ASYNC_QUEUE_URL,
@@ -185,6 +211,7 @@ async function handleTurnSubmit(connectionId, body, userId) {
         action: 'turn_submit',
         voiceId: finalVoiceId,
         engine: finalEngine,
+        voiceMode: finalVoiceMode,
         expectedTurnCount: session.turnCount || 0
       })
     }));
@@ -206,6 +233,13 @@ async function handleSessionReconnect(connectionId, body, userId) {
     const session = await getSessionById(sessionId);
     if (!session) {
       return await sendError(connectionId, 'Session not found');
+    }
+
+    // SECURITY: reconnect replays the session's current question back to the
+    // caller. Without this check any connected user could reconnect to an
+    // arbitrary sessionId and read another candidate's interview.
+    if (session.userId !== userId) {
+      return await sendError(connectionId, 'Forbidden: Session does not belong to this user', 403);
     }
 
     // Update connection mapping
@@ -338,12 +372,33 @@ async function handleTerminateSession(connectionId, body, userId) {
 exports.handler = async (event) => {
   const connectionId = event.requestContext?.connectionId;
   const routeKey = event.requestContext?.routeKey;
-  const body = JSON.parse(event.body || '{}');
-  const userId = event.requestContext?.authorizer?.uid || body.userId;
 
-  if (!userId) {
-    console.error('WebSocket message missing userId');
-    return await sendError(connectionId, 'userId required');
+  // A malformed frame used to throw here, outside the try below, surfacing as
+  // an unhandled Lambda error with no reply to the client.
+  let body;
+  try {
+    body = JSON.parse(event.body || '{}');
+  } catch (parseErr) {
+    console.warn(`Malformed WebSocket frame from ${connectionId}:`, parseErr.message);
+    await sendError(connectionId, 'Malformed message payload', 400);
+    return { statusCode: 400, body: 'Bad Request' };
+  }
+
+  // SECURITY: the WebSocket $default route has no API Gateway authorizer, so
+  // event.requestContext.authorizer is always undefined here. The previous
+  // fallback to body.userId meant the identity used for every ownership check
+  // was supplied by the client — any connected user could drive, read or
+  // terminate another user's session by sending their uid. The only trusted
+  // identity is the one $connect wrote to the connections table after
+  // verifying the Firebase ID token; resolve it from there and never from the
+  // message body.
+  const connection = await getConnection(connectionId);
+  const userId = connection?.userId;
+
+  if (!userId || connection.isActive !== 'true') {
+    console.error(`WebSocket message from unregistered/inactive connection ${connectionId}`);
+    await sendError(connectionId, 'Unauthorized: connection is not authenticated', 401);
+    return { statusCode: 401, body: 'Unauthorized' };
   }
 
   console.log(`Received WS message [${body.type || routeKey}] from connection ${connectionId}`);

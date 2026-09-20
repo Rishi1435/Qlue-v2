@@ -14,7 +14,10 @@ class AuthProvider extends ChangeNotifier {
   String _email = "";
   String _profession = "";
   List<String> _skills = [];
-  String _voiceId = "Tiffany";
+  String _voiceId = "Tiffany"; // generative default — most natural voice
+  // Voice mode: 'cost_saver' (neural, free-tier friendly) or 'premium'
+  // (generative — the most natural voices, uses more credits).
+  String _voiceMode = "cost_saver";
   String _photoUrl = "";
   String _displayName = "";
 
@@ -30,6 +33,8 @@ class AuthProvider extends ChangeNotifier {
   String get profession => _profession;
   List<String> get skills => _skills;
   String get voiceId => _voiceId;
+  String get voiceMode => _voiceMode;
+  bool get isPremiumVoice => _voiceMode == 'premium';
 
   void setBypassAuthenticated() {
     _isBypassAuthenticated = true;
@@ -50,12 +55,67 @@ class AuthProvider extends ChangeNotifier {
     return _currentUser?.displayName ?? "User";
   }
 
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-  // google_sign_in 7.x uses singleton instance
-  final GoogleSignIn _googleSignIn = GoogleSignIn.instance;
+  late final FirebaseAuth _auth;
 
-  AuthProvider() {
+  /// SECURITY FIX: Change Password previously showed a toast and did nothing.
+  /// Firebase requires a recent login before updatePassword, so we
+  /// reauthenticate with the CURRENT password first — which also means nobody
+  /// with a stolen unlocked phone can silently change the password.
+  /// Returns null on success, or a user-friendly error message.
+  Future<String?> changePassword(String currentPassword, String newPassword) async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null || user.email == null) {
+        return 'No signed-in account found. Please log in again.';
+      }
+      final hasPasswordProvider =
+          user.providerData.any((p) => p.providerId == 'password');
+      if (!hasPasswordProvider) {
+        return 'This account signs in with Google and has no password to change.';
+      }
+      final credential = EmailAuthProvider.credential(
+        email: user.email!,
+        password: currentPassword,
+      );
+      await user.reauthenticateWithCredential(credential);
+      await user.updatePassword(newPassword);
+      return null;
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'wrong-password' || e.code == 'invalid-credential') {
+        return 'Current password is incorrect.';
+      }
+      if (e.code == 'weak-password') {
+        return 'The new password is too weak.';
+      }
+      if (e.code == 'too-many-requests') {
+        return 'Too many attempts. Please try again in a few minutes.';
+      }
+      if (e.code == 'requires-recent-login') {
+        return 'For security, please log out and log back in, then retry.';
+      }
+      return 'Password change failed: ${e.message ?? e.code}';
+    } catch (e) {
+      return 'Password change failed. Please try again.';
+    }
+  }
+  // google_sign_in 7.x uses singleton instance
+  late final GoogleSignIn _googleSignIn;
+
+  /// [auth] and [googleSignIn] are injectable for tests; production uses the
+  /// default singletons.
+  AuthProvider({FirebaseAuth? auth, GoogleSignIn? googleSignIn}) {
+    _auth = auth ?? FirebaseAuth.instance;
+    _googleSignIn = googleSignIn ?? GoogleSignIn.instance;
     final startTime = DateTime.now();
+    // Safety net: if authStateChanges never emits (e.g. Firebase auth wedged
+    // or offline), don't strand the app on the splash screen forever. Clear
+    // the init gate after a hard cap so the router can route to /login.
+    Future.delayed(const Duration(seconds: 6), () {
+      if (_isInitializing) {
+        _isInitializing = false;
+        notifyListeners();
+      }
+    });
     _auth.authStateChanges().listen((User? user) async {
       final wasNull = _currentUser == null;
       _currentUser = user;
@@ -74,6 +134,14 @@ class AuthProvider extends ChangeNotifier {
         _isInitializing = false;
         notifyListeners();
       } else {
+        notifyListeners();
+      }
+    }, onError: (_) {
+      // If the auth stream errors (e.g. platform channel unavailable), don't
+      // leave the app stuck initializing — fall through to the unauthenticated
+      // state so the router can route to /login.
+      if (_isInitializing) {
+        _isInitializing = false;
         notifyListeners();
       }
     });
@@ -136,11 +204,7 @@ class AuthProvider extends ChangeNotifier {
     _clearError();
     try {
       // 1. Authenticate (Replacement for signIn() in 7.x)
-      final GoogleSignInAccount? googleUser = await _googleSignIn.authenticate();
-      if (googleUser == null) {
-        _setLoading(false);
-        return;
-      }
+      final GoogleSignInAccount googleUser = await _googleSignIn.authenticate();
 
       // 2. Authentication result (No longer a Future in 7.x)
       final GoogleSignInAuthentication googleAuth = googleUser.authentication;
@@ -197,6 +261,7 @@ class AuthProvider extends ChangeNotifier {
       _profession = data['profession'] ?? "";
       _skills = List<String>.from(data['skills'] ?? []);
       _voiceId = data['voiceId'] ?? "Tiffany";
+      _voiceMode = data['voiceMode'] ?? "cost_saver";
       _photoUrl = data['photoUrl'] ?? "";
       _displayName = data['displayName'] ?? "";
       notifyListeners();
@@ -205,13 +270,14 @@ class AuthProvider extends ChangeNotifier {
     }
   }
 
-  Future<void> updateUserProfile({String? name, String? imageUrl, String? profession, List<String>? skills, String? voiceId}) async {
+  Future<void> updateUserProfile({String? name, String? imageUrl, String? profession, List<String>? skills, String? voiceId, String? voiceMode}) async {
     if (_currentUser == null) return;
-    
+
     // Store old values for potential rollback
     final oldProfession = _profession;
     final oldSkills = List<String>.from(_skills);
     final oldVoiceId = _voiceId;
+    final oldVoiceMode = _voiceMode;
     final oldPhotoUrl = _photoUrl;
     final oldDisplayName = _displayName;
 
@@ -220,6 +286,7 @@ class AuthProvider extends ChangeNotifier {
       if (profession != null) _profession = profession;
       if (skills != null) _skills = List.from(skills);
       if (voiceId != null) _voiceId = voiceId;
+      if (voiceMode != null) _voiceMode = voiceMode;
       if (imageUrl != null) _photoUrl = imageUrl;
       if (name != null) _displayName = name;
       notifyListeners();
@@ -231,15 +298,17 @@ class AuthProvider extends ChangeNotifier {
       }
       
       // 3. Update Backend
+      final Map<String, dynamic> updateData = {};
+      if (name != null) updateData['displayName'] = name;
+      if (imageUrl != null) updateData['photoUrl'] = imageUrl;
+      if (profession != null) updateData['profession'] = profession;
+      if (skills != null) updateData['skills'] = skills;
+      if (voiceId != null) updateData['voiceId'] = voiceId;
+      if (voiceMode != null) updateData['voiceMode'] = voiceMode;
+
       await DioClient().dio.put(
         ApiConstants.authProfile,
-        data: {
-          if (name != null) 'displayName': name,
-          if (imageUrl != null) 'photoUrl': imageUrl,
-          if (profession != null) 'profession': profession,
-          if (skills != null) 'skills': skills,
-          if (voiceId != null) 'voiceId': voiceId,
-        },
+        data: updateData,
       );
 
       await _currentUser!.reload();
@@ -251,6 +320,7 @@ class AuthProvider extends ChangeNotifier {
       _profession = oldProfession;
       _skills = oldSkills;
       _voiceId = oldVoiceId;
+      _voiceMode = oldVoiceMode;
       _photoUrl = oldPhotoUrl;
       _displayName = oldDisplayName;
       notifyListeners();

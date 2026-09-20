@@ -4,19 +4,37 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:feather_icons/feather_icons.dart';
 import '../../core/theme.dart';
+import 'package:provider/provider.dart';
+import '../../context/auth_provider.dart';
+import '../../components/semi_circle_gauge.dart';
 import '../../core/models/session_model.dart';
 import '../../core/models/feedback_report_model.dart';
 import 'package:dio/dio.dart';
+import 'package:printing/printing.dart';
 import '../../core/network/dio_client.dart';
 import '../../core/constants/api_constants.dart';
 import '../../components/glass_card.dart';
 import '../../components/spectral_background.dart';
+import 'feedback_pdf_export.dart';
 
 class FeedbackReportScreen extends StatefulWidget {
   final SessionModel? session;
   final String? sessionId;
 
-  const FeedbackReportScreen({super.key, this.session, this.sessionId});
+  /// Test hooks: bypass the network fetch so the loading / error / loaded
+  /// states can be widget-tested deterministically. Not used in production.
+  final FeedbackReportModel? initialReport;
+  final String? initialError;
+  final bool autoFetch;
+
+  const FeedbackReportScreen({
+    super.key,
+    this.session,
+    this.sessionId,
+    @visibleForTesting this.initialReport,
+    @visibleForTesting this.initialError,
+    @visibleForTesting this.autoFetch = true,
+  });
 
   @override
   State<FeedbackReportScreen> createState() => _FeedbackReportScreenState();
@@ -25,6 +43,7 @@ class FeedbackReportScreen extends StatefulWidget {
 class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
   int _activeTabIndex = 0;
   bool _isLoading = true;
+  bool _isExporting = false;
   String? _errorMessage;
   FeedbackReportModel? _report;
 
@@ -41,8 +60,16 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
   @override
   void initState() {
     super.initState();
-    _startLoadingAnimation();
-    _fetchReport();
+    if (widget.initialReport != null) {
+      _report = widget.initialReport;
+      _isLoading = false;
+    } else if (widget.initialError != null) {
+      _errorMessage = widget.initialError;
+      _isLoading = false;
+    } else if (widget.autoFetch) {
+      _startLoadingAnimation();
+      _fetchReport();
+    }
   }
 
   @override
@@ -83,7 +110,7 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
         // FE-BUG FIX: Ensure data is parsed correctly even if API Gateway returns text/plain
         final rawData = response.data;
         final data = rawData is String ? jsonDecode(rawData) : rawData;
-        
+
         // The endpoint returns {session, feedback, transcript}
         var feedbackData = data['feedback'];
         if (feedbackData != null) {
@@ -95,7 +122,7 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
           if (data['transcript'] != null) {
             feedbackData['transcript'] = data['transcript'];
           }
-          
+
           setState(() {
             _report = FeedbackReportModel.fromJson(feedbackData);
             _isLoading = false;
@@ -118,7 +145,8 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
     } catch (e) {
       debugPrint("Error fetching feedback report: $e");
       // Do NOT retry on auth errors (401/403) — they won't resolve on their own.
-      final is4xxAuthError = e is DioException &&
+      final is4xxAuthError =
+          e is DioException &&
           (e.response?.statusCode == 401 || e.response?.statusCode == 403);
       if (!is4xxAuthError && retries > 0) {
         // Continue retrying only for transient failures
@@ -132,6 +160,49 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
               : "Unable to load feedback at this time. It may still be generating.";
         });
       }
+    }
+  }
+
+  Future<void> _exportPdf() async {
+    final report = _report;
+    if (report == null || _isExporting) return;
+
+    setState(() => _isExporting = true);
+    try {
+      final auth = context.read<AuthProvider>();
+      final topic = widget.session?.topic ?? 'Interview Feedback';
+      final role = auth.profession.isNotEmpty
+          ? auth.profession
+          : (widget.session?.moduleType ?? 'Candidate');
+      final score =
+          report.overallScore.round();
+
+      final bytes = await FeedbackPdfBuilder.build(
+        report: report,
+        topic: topic,
+        userName: auth.displayName,
+        role: role,
+        overallScore: score,
+      );
+
+      // Sanitize the topic into a safe filename.
+      final safeTopic = topic
+          .replaceAll(RegExp(r'[^A-Za-z0-9 _-]'), '')
+          .trim()
+          .replaceAll(RegExp(r'\s+'), '_');
+      await Printing.sharePdf(
+        bytes: bytes,
+        filename: 'Qlue_Feedback_${safeTopic.isEmpty ? 'Report' : safeTopic}.pdf',
+      );
+    } catch (e) {
+      debugPrint('PDF export failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not export PDF. Please try again.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isExporting = false);
     }
   }
 
@@ -230,10 +301,7 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
             const SizedBox(height: 16),
             Text(
               "This usually takes 15-30 seconds",
-              style: TextStyle(
-                color: t.textSecondary,
-                fontSize: 14,
-              ),
+              style: TextStyle(color: t.textSecondary, fontSize: 14),
             ),
           ],
         ),
@@ -310,78 +378,137 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
             ],
           ),
         ),
+        const SizedBox(width: 12),
+        // Export the report as a light-mode PDF that mirrors this screen.
+        GestureDetector(
+          onTap: _isExporting ? null : _exportPdf,
+          child: SizedBox(
+            width: 44,
+            height: 44,
+            child: GlassCard(
+              borderRadius: 12,
+              padding: EdgeInsets.zero,
+              hasMetallicBorder: true,
+              child: Center(
+                child: _isExporting
+                    ? SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor:
+                              AlwaysStoppedAnimation<Color>(t.primary),
+                        ),
+                      )
+                    : Icon(FeatherIcons.download, size: 20, color: t.text),
+              ),
+            ),
+          ),
+        ),
       ],
     );
   }
 
+  /// Bright, meaningful score colors: light green for strong, mustard for
+  /// medium, red for low — visible at a glance on the dark theme.
+  Color _scoreColor(num score) {
+    if (score >= 75) return const Color(0xFF4ADE80); // light green
+    if (score >= 50) return const Color(0xFFFBBF24); // mustard
+    return const Color(0xFFF87171); // red
+  }
+
   Widget _buildScoreCard(AppThemeColors t) {
     final score = _report?.overallScore.round() ?? widget.session?.score ?? 0;
+    final auth = context.read<AuthProvider>();
+    final String role = auth.profession.isNotEmpty
+        ? auth.profession
+        : (widget.session?.moduleType ?? 'Candidate');
+    final Color scoreColor = _scoreColor(score);
+
     return GlassCard(
-      padding: const EdgeInsets.symmetric(vertical: 40),
-      borderRadius: 32,
-      blurSigma: 30,
-      child: Column(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+      borderRadius: 24,
+      blurSigma: 26,
+      child: Row(
         children: [
-          Text(
-            "Overall Score",
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w800,
-              color: t.textSecondary,
-              letterSpacing: 2,
-            ),
-          ),
-          const SizedBox(height: 12),
-          Stack(
-            alignment: Alignment.center,
-            children: [
-              // Glow Effect
-              Container(
-                width: 120,
-                height: 120,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  boxShadow: [
-                    BoxShadow(
-                      color: t.primary.withValues(alpha: 0.3),
-                      blurRadius: 40,
-                      spreadRadius: 10,
+          // Identity
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  auth.displayName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w900,
+                    color: t.text,
+                    letterSpacing: -0.4,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  role,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 12.5, color: t.textSecondary),
+                ),
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 5,
+                  ),
+                  decoration: BoxDecoration(
+                    color: scoreColor.withValues(alpha: 0.10),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: scoreColor.withValues(alpha: 0.25),
                     ),
-                  ],
+                  ),
+                  child: Text(
+                    score >= 80
+                        ? "Top 15% of candidates"
+                        : score >= 50
+                        ? "Solid performance"
+                        : "Keep practicing!",
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: scoreColor,
+                    ),
+                  ),
                 ),
-              ),
-              Text(
-                "$score",
-                style: TextStyle(
-                  fontSize: 72,
-                  fontWeight: FontWeight.w900,
-                  color: t.text,
-                  height: 1.0,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            decoration: BoxDecoration(
-              color: t.success.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: t.success.withValues(alpha: 0.2)),
+              ],
             ),
-            child: Row(
+          ),
+          const SizedBox(width: 12),
+          // Score gauge
+          SemiCircleGauge(
+            progress: score / 100.0,
+            color: scoreColor,
+            trackColor: t.metallicBorder.withValues(alpha: 0.25),
+            width: 128,
+            strokeWidth: 11,
+            center: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(FeatherIcons.trendingUp, size: 14, color: t.success),
-                const SizedBox(width: 6),
                 Text(
-                  score >= 80
-                      ? "Top 15% of candidates"
-                      : "Great effort, keep practicing!",
+                  "$score",
                   style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: t.success,
+                    fontSize: 28,
+                    fontWeight: FontWeight.w900,
+                    color: scoreColor,
+                    height: 1.0,
+                  ),
+                ),
+                Text(
+                  "OVERALL",
+                  style: TextStyle(
+                    fontSize: 8.5,
+                    letterSpacing: 1.5,
+                    color: t.textTertiary,
                   ),
                 ),
               ],
@@ -393,29 +520,27 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
   }
 
   Widget _buildSpiderChartCard(AppThemeColors t) {
-    // Ensure we specifically have exactly 3 items to draw a triangle
     List<double> finalData = [0.8, 0.7, 0.9];
     List<String> finalLabels = ["Clarity", "Fluency", "Vocabulary"];
+    List<MapEntry<String, num>> allDims = [];
 
     if (_report != null && _report!.dimensionScores.isNotEmpty) {
-      final entries = _report!.dimensionScores.entries.toList();
-      if (entries.length >= 3) {
-        // Take first 3 entries
-        finalData = entries.take(3).map((e) => e.value / 100).toList();
-        finalLabels = entries.take(3).map((e) => e.key).toList();
-      } else {
-        // Pad with default data if less than 3
-        finalData = entries.map((e) => e.value / 100).toList();
-        finalLabels = entries.map((e) => e.key).toList();
-        while (finalData.length < 3) {
-          finalData.add(0.8);
-          finalLabels.add("Metric ${finalData.length}");
-        }
+      allDims =
+          _report!.dimensionScores.entries
+              .map((e) => MapEntry(e.key, e.value as num))
+              .toList()
+            ..sort((a, b) => b.value.compareTo(a.value));
+      final chartDims = allDims.take(3).toList();
+      finalData = chartDims.map((e) => e.value / 100.0).toList();
+      finalLabels = chartDims.map((e) => e.key).toList();
+      while (finalData.length < 3) {
+        finalData.add(0.8);
+        finalLabels.add("Metric ${finalData.length}");
       }
     }
 
     return GlassCard(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(20),
       borderRadius: 24,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -423,26 +548,117 @@ class _FeedbackReportScreenState extends State<FeedbackReportScreen> {
           Text(
             "Dimension Breakdown",
             style: TextStyle(
-              fontSize: 18,
+              fontSize: 16,
               fontWeight: FontWeight.bold,
               color: t.text,
             ),
           ),
-          const SizedBox(height: 30),
-          Center(
-            child: SizedBox(
-              width: 220,
-              height: 220,
-              child: CustomPaint(
-                painter: RadarChartPainter(
-                  t: t,
-                  data: finalData,
-                  labels: finalLabels,
+          const SizedBox(height: 16),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              // CLIPPING FIX: the painter draws its labels beyond the chart
+              // bounds; the inner padding keeps them inside the card.
+              SizedBox(
+                width: 150,
+                height: 150,
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: CustomPaint(
+                    painter: RadarChartPainter(
+                      t: t,
+                      data: finalData,
+                      labels: finalLabels,
+                    ),
+                  ),
                 ),
               ),
+              const SizedBox(width: 12),
+              // Every dimension with its exact value — the info the big
+              // chart alone never conveyed.
+              Expanded(
+                child: Column(
+                  children:
+                      (allDims.isEmpty
+                              ? finalLabels.asMap().entries.map(
+                                  (e) => MapEntry(
+                                    e.value,
+                                    (finalData[e.key] * 100),
+                                  ),
+                                )
+                              : allDims.map(
+                                  (e) => MapEntry(e.key, e.value.toDouble()),
+                                ))
+                          .map(
+                            (d) => _buildDimensionBar(
+                              t,
+                              d.key,
+                              d.value.toDouble(),
+                            ),
+                          )
+                          .toList(),
+                ),
+              ),
+            ],
+          ),
+          if (allDims.length >= 2) ...[
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Icon(FeatherIcons.award, size: 13, color: t.success),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    "Strongest: ${allDims.first.key} · Focus next: ${allDims.last.key}",
+                    style: TextStyle(fontSize: 11.5, color: t.textSecondary),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDimensionBar(AppThemeColors t, String label, double value) {
+    final Color barColor = _scoreColor(value);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 9),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11.5, color: t.textSecondary),
+                ),
+              ),
+              Text(
+                "${value.round()}",
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.bold,
+                  color: t.text,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: (value / 100).clamp(0.0, 1.0),
+              minHeight: 5,
+              backgroundColor: t.metallicBorder.withValues(alpha: 0.15),
+              valueColor: AlwaysStoppedAnimation<Color>(barColor),
             ),
           ),
-          const SizedBox(height: 20),
         ],
       ),
     );
@@ -745,7 +961,9 @@ class RadarChartPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
-    final radius = min(size.width, size.height) / 2;
+    // CLIPPING FIX: reserve room inside the canvas for the vertex labels
+    // instead of drawing them 20px beyond the bounds.
+    final radius = min(size.width, size.height) / 2 - 24;
     final angleStep = (2 * pi) / data.length;
 
     // 1. Draw Background Grid (Concentric Pentagons/Polygons)
@@ -787,8 +1005,8 @@ class RadarChartPainter extends CustomPainter {
 
       // Labels
       final labelOffset = Offset(
-        center.dx + (radius + 20) * cos(angle),
-        center.dy + (radius + 15) * sin(angle),
+        center.dx + (radius + 16) * cos(angle),
+        center.dy + (radius + 14) * sin(angle),
       );
       _drawText(canvas, labels[i], labelOffset, t);
     }
@@ -810,36 +1028,40 @@ class RadarChartPainter extends CustomPainter {
     }
     dataPath.close();
 
+    // BRIGHT DATA POLYGON: light-green glassy fill with a luminous edge —
+    // the dull dark-green triangle read as 'broken' on the dark card.
+    const Color radarBright = Color(0xFF4ADE80);
     final fillPaint = Paint()
       ..shader = RadialGradient(
         colors: [
-          t.primary.withValues(alpha: 0.4),
-          t.primary.withValues(alpha: 0.1),
+          radarBright.withValues(alpha: 0.45),
+          radarBright.withValues(alpha: 0.08),
         ],
       ).createShader(Rect.fromCircle(center: center, radius: radius))
       ..style = PaintingStyle.fill;
 
     final outlinePaint = Paint()
-      ..color = t.primary
+      ..color = radarBright
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.0
-      ..maskFilter = const MaskFilter.blur(BlurStyle.solid, 2);
+      ..strokeWidth = 2.4
+      ..maskFilter = const MaskFilter.blur(BlurStyle.solid, 3);
 
     canvas.drawPath(dataPath, fillPaint);
     canvas.drawPath(dataPath, outlinePaint);
 
     // Draw dots at vertices
     final dotPaint = Paint()
-      ..color = t.primary
+      ..color = radarBright
       ..style = PaintingStyle.fill;
+    final dotHalo = Paint()
+      ..color = radarBright.withValues(alpha: 0.35)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
     for (var i = 0; i < data.length; i++) {
       final r = radius * data[i];
       final angle = i * angleStep - (pi / 2);
-      canvas.drawCircle(
-        Offset(center.dx + r * cos(angle), center.dy + r * sin(angle)),
-        4,
-        dotPaint,
-      );
+      final v = Offset(center.dx + r * cos(angle), center.dy + r * sin(angle));
+      canvas.drawCircle(v, 6, dotHalo);
+      canvas.drawCircle(v, 3.5, dotPaint);
     }
   }
 

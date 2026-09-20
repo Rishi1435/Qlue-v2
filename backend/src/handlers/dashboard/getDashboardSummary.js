@@ -31,19 +31,26 @@ exports.handler = async (event) => {
     try {
         // Resolve userId from the Custom Authorizer context
         const auth = event.requestContext?.authorizer;
-        const userId = auth?.uid || auth?.claims?.sub || event.queryStringParameters?.userId;
+        // SECURITY: no ?userId= fallback — it let any signed-in user read
+        // another user's dashboard.
+        const userId = auth?.uid || auth?.claims?.sub || auth?.principalId;
         if (!userId) {
             return { statusCode: 401, body: JSON.stringify({ error: 'Unauthorized. User ID missing.' }) };
         }
 
         // Prepare Query Commands
+        // PERF-FIX #9: Project only the two attributes the aggregation needs.
+        // Session items carry itemData (resume summaries, scraped website
+        // content, etc.), so an unprojected query transferred kilobytes per
+        // session that were immediately discarded.
         const sessionCmd = new QueryCommand({
             TableName: SESSIONS_TABLE,
             IndexName: 'GSI_UserIdStartedAt',
             KeyConditionExpression: 'userId = :uid',
             ExpressionAttributeValues: {
                 ':uid': userId
-            }
+            },
+            ProjectionExpression: 'moduleType, accumulatedScores, discarded'
         });
 
         const userCmd = new GetCommand({
@@ -57,14 +64,16 @@ exports.handler = async (event) => {
             docClient.send(userCmd)
         ]);
 
-        const sessions = sessionData.Items || [];
+        const sessions = (sessionData.Items || []).filter(x => !x.discarded); // discarded sessions never count
         const userProfile = userData.Item || null;
         const globalInsights = userProfile?.globalInsights || null;
 
         // Metrics Accumulators
         let totalSessions = sessions.length;
-        let moduleBreakdown = { RESUME: 0, HR: 0, WEBSITE: 0, INTRO: 0 };
-        let bestScoreByModule = { RESUME: 0, HR: 0, WEBSITE: 0, INTRO: 0 };
+        // JD added: job-match sessions counted toward totals but were invisible
+        // in the per-module breakdown and best-score tiles.
+        let moduleBreakdown = { RESUME: 0, HR: 0, WEBSITE: 0, INTRO: 0, JD: 0 };
+        let bestScoreByModule = { RESUME: 0, HR: 0, WEBSITE: 0, INTRO: 0, JD: 0 };
         let scoresArray = [];
         let completedSessions = 0;
 
@@ -120,6 +129,8 @@ exports.handler = async (event) => {
 
     } catch (err) {
         console.error('getDashboardSummary Failed:', err);
-        return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
+        // Detail stays in CloudWatch; clients get a generic message so internal
+        // table names and SDK errors are not echoed back over the API.
+        return { statusCode: 500, body: JSON.stringify({ error: 'INTERNAL_ERROR', message: 'Could not load your dashboard. Please try again.' }) };
     }
 };

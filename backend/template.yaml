@@ -28,6 +28,11 @@ Globals:
         WEBSOCKET_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
         BEDROCK_MODEL_ID: 'nvidia.nemotron-super-3-120b'
         ALLOWED_VOICES: "Tiffany,Ruth,Joanna,Matthew,Stephen"
+        # COST-FIX: neural is $16/1M chars with 1M chars/month free (12 mo);
+        # generative is $30/1M with only 100K free. Set POLLY_ALLOW_GENERATIVE
+        # to 'true' to permit generative voices (e.g. Tiffany) at extra cost.
+        POLLY_DEFAULT_ENGINE: 'generative'
+        POLLY_ALLOW_GENERATIVE: 'true'  # user preference: natural generative voices (funded by credits)
 
 Resources:
   # ==============================================================================
@@ -333,12 +338,41 @@ Resources:
           - Id: AutoDelete
             Status: Enabled
             ExpirationInDays: 30
+      # Presigned-PUT uploads of JD PDFs go directly to this bucket from the
+      # client, so the web build needs a CORS allowance (mirrors ResumesBucket).
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['PUT']
+            AllowedOrigins: ['*']
 
   AudioBucket:
     Type: AWS::S3::Bucket
     Properties:
+      # COST-FIX: versioning suspended (turn audio is throwaway; old versions
+      # accumulated storage forever) and lifecycle rules added so synthesized
+      # audio self-deletes after 1 day and failed uploads don't linger.
       VersioningConfiguration:
-        Status: Enabled
+        Status: Suspended
+      # NOTE: a single LifecycleConfiguration only — CloudFormation rejects a
+      # duplicate property. Turn audio (audio/ prefix) is throwaway and expires
+      # in 1 day; a broader 7-day catch-all sweeps anything else, and
+      # incomplete multipart uploads are aborted after 1 day.
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTurnAudio
+            Status: Enabled
+            Prefix: audio/
+            ExpirationInDays: 1
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: AutoDeleteAudio
+            Status: Enabled
+            ExpirationInDays: 7
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -348,11 +382,6 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
-      LifecycleConfiguration:
-        Rules:
-          - Id: AutoDeleteAudio
-            Status: Enabled
-            ExpirationInDays: 7
 
   # ==============================================================================
   # API GATEWAYS
@@ -499,24 +528,14 @@ Resources:
       TopicName: qlue-feedback-trigger
 
   # ==============================================================================
-  # SECRETS
+  # RUNTIME CONFIGURATION
+  # COST-FIX: Secrets Manager resources removed ($0.40/secret/month while
+  # idle). Configuration now lives in SSM Parameter Store standard-tier
+  # SecureString parameters under /qlue/*, created once out-of-band via
+  # scripts/migrate-secrets-to-ssm.sh (CloudFormation cannot create
+  # SecureString parameters, and String parameters would expose values in
+  # the template).
   # ==============================================================================
-  FirebaseServiceAccountSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: qlue/firebase-service-account
-  BedrockConfigSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: qlue/bedrock-config
-  ScraperApiKeySecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: qlue/scraper-api-key
-  FcmServerKeySecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: qlue/fcm-server-key
 
   # ==============================================================================
   # LAMBDA FUNCTIONS
@@ -533,8 +552,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   RegisterUserFunction:
     Type: AWS::Serverless::Function
@@ -553,8 +571,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   LoginUserFunction:
     Type: AWS::Serverless::Function
@@ -573,8 +590,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   LoginWithGoogleFunction:
     Type: AWS::Serverless::Function
@@ -593,8 +609,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   RefreshTokenFunction:
     Type: AWS::Serverless::Function
@@ -613,8 +628,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   LogoutUserFunction:
     Type: AWS::Serverless::Function
@@ -633,8 +647,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   DeleteAccountFunction:
     Type: AWS::Serverless::Function
@@ -653,8 +666,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   GetUserProfileFunction:
     Type: AWS::Serverless::Function
@@ -673,8 +685,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   UpdateUserProfileFunction:
     Type: AWS::Serverless::Function
@@ -693,8 +704,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   SyncUserFunction:
     Type: AWS::Serverless::Function
@@ -713,8 +723,7 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UsersTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref FirebaseServiceAccountSecret
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   UpdateFcmTokenFunction:
     Type: AWS::Serverless::Function
@@ -790,7 +799,7 @@ Resources:
                 - bedrock:InvokeModel
                 - bedrock:InvokeModelWithResponseStream
               Resource: '*'
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
         - Statement:
 
             - Effect: Allow
@@ -926,8 +935,10 @@ Resources:
     Properties:
       Handler: handlers/interview/initializeSession.handler
       CodeUri: src/
-      MemorySize: 256
-      Timeout: 15
+      # WEBSITE module fallback path may scrape (tiered, up to render+proxy);
+      # 15s guaranteed timeouts. Cached path returns in milliseconds.
+      MemorySize: 512
+      Timeout: 60
       Events:
         Api:
           Type: Api
@@ -945,8 +956,7 @@ Resources:
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], Resource: '*' }]
         - SNSPublishMessagePolicy: { TopicName: !GetAtt FeedbackTriggerTopic.TopicName }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
 
   ProcessUserInputFunction:
@@ -973,8 +983,11 @@ Resources:
     Properties:
       Handler: handlers/interview/generateQuestion.handler
       CodeUri: src/
-      MemorySize: 512
-      Timeout: 30
+      # PERF-FIX #8: Lambda CPU scales with memory; LLM-orchestrating functions
+      # run faster (and often cheaper) at 1024MB. Timeout raised above the 45s
+      # Bedrock TTFT guard in lib/bedrock.js so the SDK abort fires first.
+      MemorySize: 1024
+      Timeout: 55
       Events:
         Api:
           Type: Api
@@ -991,8 +1004,7 @@ Resources:
         - DynamoDBCrudPolicy: { TableName: !Ref ResumesTable }
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], Resource: '*' }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
 
   ManageContextWindowFunction:
@@ -1018,8 +1030,7 @@ Resources:
         - DynamoDBCrudPolicy: { TableName: !Ref ResumesTable }
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], Resource: '*' }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
 
   ControlTurnFlowFunction:
@@ -1045,8 +1056,7 @@ Resources:
         - DynamoDBCrudPolicy: { TableName: !Ref ResumesTable }
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], Resource: '*' }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
 
   TerminateSessionFunction:
@@ -1076,8 +1086,7 @@ Resources:
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['lambda:InvokeFunction'], Resource: !GetAtt TriggerFeedbackGenerationFunction.Arn }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
         - SNSPublishMessagePolicy: { TopicName: !GetAtt FeedbackTriggerTopic.TopicName }
 
   # ==============================================================================
@@ -1130,15 +1139,10 @@ Resources:
         - Statement: [{ Effect: Allow, Action: ['execute-api:ManageConnections'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], Resource: '*' }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
         - SNSPublishMessagePolicy: { TopicName: !GetAtt FeedbackTriggerTopic.TopicName }
         - S3CrudPolicy: { BucketName: !Ref ScrapedContentBucket }
         - S3CrudPolicy: { BucketName: !Ref AudioBucket }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref ScraperApiKeySecret }
-      Environment:
-        Variables:
-          FEEDBACK_TOPIC_ARN: !Ref FeedbackTriggerTopic
 
 
   # ========= WEBSOCKET =========
@@ -1151,7 +1155,7 @@ Resources:
       Timeout: 10
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref WSConnectionsTable }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
         - Statement: [{ Effect: Allow, Action: ['execute-api:ManageConnections'], Resource: '*' }]
 
 
@@ -1171,7 +1175,8 @@ Resources:
     Properties:
       Handler: handlers/websocket/sendTextHandler.handler
       CodeUri: src/
-      MemorySize: 256
+      # PERF-FIX #8: on the critical path of every spoken turn (WS -> SQS).
+      MemorySize: 512
       Timeout: 10
       Environment:
         Variables:
@@ -1188,12 +1193,11 @@ Resources:
         - Statement: [{ Effect: Allow, Action: ['execute-api:ManageConnections'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'], Resource: '*' }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
         - SNSPublishMessagePolicy: { TopicName: !GetAtt FeedbackTriggerTopic.TopicName }
         - S3CrudPolicy: { BucketName: !Ref ScrapedContentBucket }
         - S3CrudPolicy: { BucketName: !Ref AudioBucket }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref ScraperApiKeySecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
         - Statement: [{ Effect: Allow, Action: ['sqs:SendMessage'], Resource: !GetAtt AsyncInterviewQueue.Arn }]
 
 
@@ -1249,8 +1253,7 @@ Resources:
             - Effect: Allow
               Action: lambda:InvokeFunction
               Resource: !GetAtt AnalyzeTranscriptFunction.Arn
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FcmServerKeySecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   AnalyzeTranscriptFunction:
     Type: AWS::Serverless::Function
@@ -1262,13 +1265,12 @@ Resources:
       Environment:
         Variables:
           GENERATE_REPORT_LAMBDA: !Ref GenerateFeedbackReportFunction
-      Events:
-        Api:
-          Type: Api
-          Properties:
-            Path: /feedback/analyze
-            Method: post
-            RestApiId: !Ref RestApi
+      # SECURITY: the feedback pipeline stages are internal, invoked only via
+      # SNS -> triggerFeedbackGeneration -> lambda:InvokeFunction. Exposing them
+      # as public REST routes let any signed-in caller drive paid Bedrock
+      # inference and write feedback rows for arbitrary userIds, with an event
+      # shape (raw payload, not an API Gateway event) that skips every
+      # ownership check. The Api events have been removed.
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
         - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
@@ -1282,8 +1284,7 @@ Resources:
             - Effect: Allow
               Action: lambda:InvokeFunction
               Resource: !GetAtt GenerateFeedbackReportFunction.Arn
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FcmServerKeySecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   ComputeModuleScoresFunction:
     Type: AWS::Serverless::Function
@@ -1292,13 +1293,7 @@ Resources:
       CodeUri: src/
       MemorySize: 256
       Timeout: 15
-      Events:
-        Api:
-          Type: Api
-          Properties:
-            Path: /feedback/scores
-            Method: post
-            RestApiId: !Ref RestApi
+      # SECURITY: internal pipeline stage — see AnalyzeTranscriptFunction.
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
         - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
@@ -1308,8 +1303,7 @@ Resources:
         - DynamoDBCrudPolicy: { TableName: !Ref NotificationsTable }
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel'], Resource: '*' }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FcmServerKeySecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   GenerateFeedbackReportFunction:
     Type: AWS::Serverless::Function
@@ -1321,13 +1315,7 @@ Resources:
       Environment:
         Variables:
           STORE_FEEDBACK_LAMBDA: !Ref StoreFeedbackReportFunction
-      Events:
-        Api:
-          Type: Api
-          Properties:
-            Path: /feedback/report
-            Method: post
-            RestApiId: !Ref RestApi
+      # SECURITY: internal pipeline stage — see AnalyzeTranscriptFunction.
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
         - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
@@ -1341,8 +1329,7 @@ Resources:
             - Effect: Allow
               Action: lambda:InvokeFunction
               Resource: !GetAtt StoreFeedbackReportFunction.Arn
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FcmServerKeySecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   StoreFeedbackReportFunction:
     Type: AWS::Serverless::Function
@@ -1354,13 +1341,7 @@ Resources:
       Environment:
         Variables:
           SEND_NOTIFICATION_LAMBDA: !Ref SendFeedbackNotificationFunction
-      Events:
-        Api:
-          Type: Api
-          Properties:
-            Path: /feedback/store
-            Method: post
-            RestApiId: !Ref RestApi
+      # SECURITY: internal pipeline stage — see AnalyzeTranscriptFunction.
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
         - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
@@ -1374,8 +1355,7 @@ Resources:
             - Effect: Allow
               Action: lambda:InvokeFunction
               Resource: !GetAtt SendFeedbackNotificationFunction.Arn
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FcmServerKeySecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   SendFeedbackNotificationFunction:
     Type: AWS::Serverless::Function
@@ -1384,13 +1364,7 @@ Resources:
       CodeUri: src/
       MemorySize: 256
       Timeout: 10
-      Events:
-        Api:
-          Type: Api
-          Properties:
-            Path: /feedback/notify
-            Method: post
-            RestApiId: !Ref RestApi
+      # SECURITY: internal pipeline stage — see AnalyzeTranscriptFunction.
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
         - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
@@ -1400,8 +1374,7 @@ Resources:
         - DynamoDBCrudPolicy: { TableName: !Ref NotificationsTable }
         - Statement: [{ Effect: Allow, Action: ['polly:SynthesizeSpeech'], Resource: '*' }]
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel'], Resource: '*' }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref BedrockConfigSecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FcmServerKeySecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   # ========= DASHBOARD =========
   GetDashboardSummaryFunction:
@@ -1423,7 +1396,7 @@ Resources:
         - DynamoDBCrudPolicy: { TableName: !Ref FeedbackTable }
         - DynamoDBCrudPolicy: { TableName: !Ref TranscriptsTable }
         - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
   GetScoreTrendsFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -1440,7 +1413,7 @@ Resources:
             RestApiId: !Ref RestApi
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   GetModuleStatsFunction:
     Type: AWS::Serverless::Function
@@ -1458,7 +1431,7 @@ Resources:
             RestApiId: !Ref RestApi
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   GetSessionHistoryFunction:
     Type: AWS::Serverless::Function
@@ -1476,7 +1449,7 @@ Resources:
             RestApiId: !Ref RestApi
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   UpdateGlobalProfileFunction:
     Type: AWS::Serverless::Function
@@ -1525,7 +1498,7 @@ Resources:
         - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
         - DynamoDBCrudPolicy: { TableName: !Ref FeedbackTable }
         - DynamoDBCrudPolicy: { TableName: !Ref TranscriptsTable }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   GetTranscriptFunction:
     Type: AWS::Serverless::Function
@@ -1543,7 +1516,7 @@ Resources:
             RestApiId: !Ref RestApi
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref TranscriptsTable }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   # ========= SCRAPER =========
   FetchAndCleanContentFunction:
@@ -1562,8 +1535,49 @@ Resources:
             RestApiId: !Ref RestApi
       Policies:
         - S3CrudPolicy: { BucketName: !Ref ScrapedContentBucket }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref ScraperApiKeySecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
+
+  AnalyzeJobMatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers/jd/analyzeJobMatch.handler
+      CodeUri: src/
+      MemorySize: 1024
+      # JS-rendering + residential-proxy scrape tiers can take 30s+; give the
+      # scrape escalation and the LLM comparison enough headroom.
+      Timeout: 90
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /jd/analyze
+            Method: post
+            RestApiId: !Ref RestApi
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ResumesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel'], Resource: '*' }]
+        # JD PDF path: read the uploaded file and run Textract text detection.
+        - S3ReadPolicy: { BucketName: !Ref ScrapedContentBucket }
+        - Statement: [{ Effect: Allow, Action: ['textract:StartDocumentTextDetection', 'textract:GetDocumentTextDetection'], Resource: '*' }]
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
+
+  GenerateJdUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers/jd/generateJdUploadUrl.handler
+      CodeUri: src/
+      MemorySize: 256
+      Timeout: 10
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /jd/upload-url
+            Method: post
+            RestApiId: !Ref RestApi
+      Policies:
+        - S3CrudPolicy: { BucketName: !Ref ScrapedContentBucket }
 
   ValidateWebsiteFunction:
     Type: AWS::Serverless::Function
@@ -1582,8 +1596,7 @@ Resources:
       Policies:
         - S3CrudPolicy: { BucketName: !Ref ScrapedContentBucket }
         - Statement: [{ Effect: Allow, Action: ['bedrock:InvokeModel'], Resource: '*' }]
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref ScraperApiKeySecret }
-        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref FirebaseServiceAccountSecret }
+        - SSMParameterReadPolicy: { ParameterName: qlue/* }
 
   # ==============================================================================
   # CLOUDWATCH ALARMS

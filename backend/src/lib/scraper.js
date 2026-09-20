@@ -59,55 +59,181 @@ function cleanHtmlToText(html) {
 /**
  * Fetches content from a URL via scrape.do and cleans it.
  */
+/**
+ * LinkedIn job URLs render nothing useful for scrapers behind a login wall,
+ * BUT LinkedIn exposes an unauthenticated guest endpoint per job posting that
+ * returns clean server-rendered HTML of the description. If we can pull the
+ * numeric job id out of the URL, we rewrite to that endpoint — far more
+ * reliable than trying to render the full logged-out job page.
+ *
+ * Handles: /jobs/view/1234567890, ...-1234567890 slug tails, and
+ * ?currentJobId=1234567890 (LinkedIn's collections/search URLs).
+ */
+function linkedInGuestUrl(url) {
+  if (!/linkedin\.com/i.test(url)) return null;
+  const patterns = [
+    /jobs\/view\/(\d{6,})/i,
+    /currentJobId=(\d{6,})/i,
+    /-(\d{10,})(?:[/?]|$)/,
+  ];
+  for (const re of patterns) {
+    const m = url.match(re);
+    if (m) {
+      return `https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/${m[1]}`;
+    }
+  }
+  return null;
+}
+
+// A desktop browser UA so plain fetches aren't trivially rejected by origins
+// that block obvious bots/no-UA requests.
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36';
+
+/**
+ * fetch() with a hard timeout so a hung origin can't stall the Lambda.
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Single fetch attempt through scrape.do with optional JS rendering and
+ * residential ("super") proxies.
+ */
+async function scrapeDoFetch(apiKey, targetUrl, { render = false, superProxy = false } = {}) {
+  const params = new URLSearchParams({ token: apiKey, url: targetUrl });
+  if (render) params.set('render', 'true');
+  if (superProxy) params.set('super', 'true');
+
+  const response = await fetchWithTimeout(`https://api.scrape.do?${params.toString()}`, {}, 30000);
+  if (!response.ok) {
+    throw new QlueError(
+      `Scraper failed to fetch target URL. Status: ${response.status}`,
+      ERROR_CODES.URL_UNREACHABLE, 400
+    );
+  }
+  return response.text();
+}
+
+/**
+ * Direct fetch of the target URL — no proxy, no JS rendering. Free and instant,
+ * and it works for the majority of public articles, docs and company career
+ * pages. Used as the first tier when scrape.do isn't configured, and as the
+ * last-ditch fallback when every proxied tier fails.
+ */
+async function directFetch(targetUrl) {
+  const response = await fetchWithTimeout(targetUrl, {
+    headers: {
+      'User-Agent': BROWSER_UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9'
+    },
+    redirect: 'follow'
+  }, 12000);
+  if (!response.ok) {
+    throw new QlueError(
+      `Direct fetch failed. Status: ${response.status}`,
+      ERROR_CODES.URL_UNREACHABLE, 400
+    );
+  }
+  return response.text();
+}
+
+/**
+ * Fetches and cleans page content, escalating through cheaper -> pricier
+ * strategies and stopping as soon as one yields enough text:
+ *   1. LinkedIn guest job API rewrite (when applicable) — cheap & reliable
+ *   2. plain proxy fetch — cheapest, works for static/company career pages
+ *   3. JS rendering — for React/SPA job boards (Indeed, Greenhouse, Lever...)
+ *   4. JS rendering + residential proxies — for aggressive anti-bot sites
+ * Each tier costs more scrape.do credits, so we only escalate on failure.
+ */
 async function fetchAndCleanContent(url) {
   if (!isValidUrl(url)) {
     throw new QlueError('Invalid URL provided', ERROR_CODES.INVALID_URL, 400);
   }
 
-  const apiKey = await getScraperApiKey();
-  if (!apiKey) {
-    throw new QlueError('Scraper API key not configured', ERROR_CODES.INTERNAL_ERROR, 500);
-  }
-
-  const encodedTargetUrl = encodeURIComponent(url);
-  const scrapeApiUrl = `https://api.scrape.do?token=${apiKey}&url=${encodedTargetUrl}`;
-
+  // The scrape.do key is optional now: without it we still attempt a direct
+  // fetch, which handles most public pages. Key lookup failures are non-fatal.
+  let apiKey = null;
   try {
-    // Native Node v18+ fetch
-    const response = await fetch(scrapeApiUrl);
-    
-    if (!response.ok) {
-      throw new QlueError(`Scraper failed to fetch target URL. Status: ${response.status}`, ERROR_CODES.URL_UNREACHABLE, 400);
-    }
-
-    const htmlContent = await response.text();
-    const titleMatch = htmlContent.match(/<title>([^<]+)<\/title>/i);
-    const title = titleMatch ? titleMatch[1].trim() : url;
-
-    const cleanedText = cleanHtmlToText(htmlContent);
-
-    if (cleanedText.length < MIN_CONTENT_LENGTH) {
-      throw new QlueError('Extracted content is too short for interviewing.', ERROR_CODES.CONTENT_TOO_SHORT, 400);
-    }
-
-    const wordCount = cleanedText.split(/\s+/).length;
-    // Arbitrary conceptual extraction metric stub, Bedrock handles real conceptual splits later
-    const conceptCount = Math.ceil(wordCount / 500); 
-
-    return {
-      content: cleanedText,
-      title: title,
-      conceptCount,
-      wordCount
-    };
-
-  } catch (error) {
-    if (error instanceof QlueError) throw error;
-    throw new QlueError('Failed to scrape content', ERROR_CODES.URL_UNREACHABLE, 500, error.message);
+    apiKey = await getScraperApiKey();
+  } catch (keyErr) {
+    console.warn('Scraper API key unavailable; falling back to direct fetch only:', keyErr.message);
   }
+
+  // LinkedIn rewrite becomes the primary target when we can extract a job id.
+  const guestUrl = linkedInGuestUrl(url);
+  const primaryUrl = guestUrl || url;
+
+  // Build the tier list cheapest -> most expensive. Direct fetch is always the
+  // first tier (free, instant, works for most public pages). scrape.do tiers
+  // are appended only when a key is configured, escalating from plain proxy to
+  // JS rendering to residential proxies for aggressive anti-bot sites.
+  const tiers = [{ kind: 'direct' }];
+  if (apiKey) {
+    tiers.push(
+      { kind: 'scrapedo', render: false },
+      { kind: 'scrapedo', render: true },
+      { kind: 'scrapedo', render: true, superProxy: true }
+    );
+  }
+
+  let lastError = null;
+  let bestText = '';
+
+  for (const tier of tiers) {
+    try {
+      const htmlContent = tier.kind === 'direct'
+        ? await directFetch(primaryUrl)
+        : await scrapeDoFetch(apiKey, primaryUrl, tier);
+
+      const titleMatch = htmlContent.match(/<title>([^<]+)<\/title>/i);
+      const title = titleMatch ? titleMatch[1].trim() : url;
+      const cleanedText = cleanHtmlToText(htmlContent);
+
+      if (cleanedText.length >= MIN_CONTENT_LENGTH) {
+        const wordCount = cleanedText.split(/\s+/).length;
+        return {
+          content: cleanedText,
+          title,
+          conceptCount: Math.ceil(wordCount / 500),
+          wordCount
+        };
+      }
+      // Remember the most content we've seen in case every tier is thin.
+      if (cleanedText.length > bestText.length) {
+        bestText = cleanedText;
+      }
+    } catch (error) {
+      lastError = error;
+      // Try the next, stronger tier.
+    }
+  }
+
+  // Every tier failed to reach MIN_CONTENT_LENGTH.
+  if (bestText.length > 0) {
+    throw new QlueError(
+      'The page could not be read fully — this site heavily restricts automated access. Paste the text instead.',
+      ERROR_CODES.CONTENT_TOO_SHORT, 400
+    );
+  }
+  throw new QlueError(
+    'Failed to scrape content',
+    ERROR_CODES.URL_UNREACHABLE, 400,
+    lastError?.message
+  );
 }
 
 module.exports = {
   fetchAndCleanContent,
-  cleanHtmlToText
+  cleanHtmlToText,
+  linkedInGuestUrl
 };

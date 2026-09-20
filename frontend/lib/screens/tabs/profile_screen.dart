@@ -7,6 +7,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:go_router/go_router.dart';
 import '../../core/theme.dart';
 import '../../context/auth_provider.dart';
+import '../../context/appearance_provider.dart';
 import '../../context/dashboard_provider.dart';
 import '../../context/resume_provider.dart';
 import '../../components/input_field.dart';
@@ -276,7 +277,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
         final file = result.files.single;
         
         if (kIsWeb && file.bytes != null) {
-          if (context.mounted) {
+          if (mounted) {
             Notify.info(context, "Cloud profile sync is being prioritized. Using local preview.");
           }
           auth.updateUserProfile(
@@ -286,7 +287,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           await auth.updateUserProfile(
             imageUrl: file.path,
           );
-          if (context.mounted) Notify.success(context, "Profile picture updated!");
+          if (mounted) Notify.success(context, "Profile picture updated!");
         }
       }
     } catch (e) {
@@ -313,14 +314,230 @@ class _ProfileScreenState extends State<ProfileScreen> {
     }
   }
 
+  void _showAppearanceSheet() {
+    final t = AppThemeColors.of(context);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => Consumer<AppearanceProvider>(
+        builder: (ctx, appearance, _) => Container(
+          padding: EdgeInsets.only(
+            left: 24, right: 24, top: 20,
+            bottom: MediaQuery.of(ctx).padding.bottom + 24,
+          ),
+          decoration: BoxDecoration(
+            color: t.bgSecondary,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+            border: Border.all(color: t.metallicBorder.withValues(alpha: 0.2)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40, height: 4,
+                  decoration: BoxDecoration(
+                    color: t.textTertiary.withValues(alpha: 0.4),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              Text("Appearance",
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: t.text)),
+              const SizedBox(height: 4),
+              Text("Make Qlue yours — changes apply instantly everywhere.",
+                  style: TextStyle(fontSize: 12, color: t.textTertiary)),
+              const SizedBox(height: 20),
+              Text("GLASS STYLE",
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold,
+                      letterSpacing: 1, color: t.textTertiary)),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(child: _styleChoice(t, "Liquid Glass", "liquid", appearance)),
+                  const SizedBox(width: 10),
+                  Expanded(child: _styleChoice(t, "Classic", "classic", appearance)),
+                ],
+              ),
+              const SizedBox(height: 20),
+              Text("GLASS INTENSITY",
+                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold,
+                      letterSpacing: 1, color: t.textTertiary)),
+              Slider(
+                value: appearance.glassIntensity,
+                min: 0.6, max: 1.4,
+                activeColor: t.primary,
+                inactiveColor: t.metallicBorder.withValues(alpha: 0.3),
+                onChanged: (v) => appearance.setGlassIntensity(v),
+              ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text("Subtle", style: TextStyle(fontSize: 11, color: t.textTertiary)),
+                  Text("Heavy", style: TextStyle(fontSize: 11, color: t.textTertiary)),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text("Reduce motion",
+                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text)),
+                      Text("Calms ambient animations, saves battery",
+                          style: TextStyle(fontSize: 11, color: t.textTertiary)),
+                    ],
+                  ),
+                  Switch(
+                    value: appearance.reduceMotion,
+                    activeColor: t.primary,
+                    onChanged: (v) => appearance.setReduceMotion(v),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _styleChoice(AppThemeColors t, String label, String value, AppearanceProvider appearance) {
+    final selected = appearance.glassStyle == value;
+    return GestureDetector(
+      onTap: () => appearance.setGlassStyle(value),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14),
+        decoration: BoxDecoration(
+          color: selected ? t.primary.withValues(alpha: 0.18) : t.bg.withValues(alpha: 0.4),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+              color: selected ? t.primary : t.metallicBorder.withValues(alpha: 0.3)),
+        ),
+        child: Center(
+          child: Text(label,
+              style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  color: selected ? t.primary : t.textSecondary)),
+        ),
+      ),
+    );
+  }
+
+  void _showChangePasswordDialog() {
+    final t = AppThemeColors.of(context);
+    final currentCtrl = TextEditingController();
+    final newCtrl = TextEditingController();
+    final confirmCtrl = TextEditingController();
+    bool busy = false;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          backgroundColor: t.bgSecondary,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          title: Text("Change Password",
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: t.text)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _passwordField(t, currentCtrl, "Current password"),
+              const SizedBox(height: 12),
+              _passwordField(t, newCtrl, "New password (min 8, letters + numbers)"),
+              const SizedBox(height: 12),
+              _passwordField(t, confirmCtrl, "Confirm new password"),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: busy ? null : () => Navigator.of(ctx).pop(),
+              child: Text("Cancel", style: TextStyle(color: t.textSecondary)),
+            ),
+            TextButton(
+              onPressed: busy
+                  ? null
+                  : () async {
+                      final current = currentCtrl.text;
+                      final fresh = newCtrl.text;
+                      if (fresh.length < 8 ||
+                          !RegExp(r'[A-Za-z]').hasMatch(fresh) ||
+                          !RegExp(r'[0-9]').hasMatch(fresh)) {
+                        Notify.error(context,
+                            "New password must be 8+ characters with letters and numbers.");
+                        return;
+                      }
+                      if (fresh != confirmCtrl.text) {
+                        Notify.error(context, "New passwords do not match.");
+                        return;
+                      }
+                      if (fresh == current) {
+                        Notify.error(context, "New password must differ from the current one.");
+                        return;
+                      }
+                      setDialogState(() => busy = true);
+                      final err = await context
+                          .read<AuthProvider>()
+                          .changePassword(current, fresh);
+                      if (!mounted || !ctx.mounted) return;
+                      setDialogState(() => busy = false);
+                      if (err == null) {
+                        Navigator.of(ctx).pop();
+                        Notify.success(context, "Password updated successfully.");
+                      } else {
+                        Notify.error(context, err);
+                      }
+                    },
+              child: busy
+                  ? SizedBox(
+                      width: 16, height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: t.primary))
+                  : Text("Update",
+                      style: TextStyle(color: t.primary, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _passwordField(AppThemeColors t, TextEditingController ctrl, String hint) {
+    return TextField(
+      controller: ctrl,
+      obscureText: true,
+      autocorrect: false,
+      enableSuggestions: false,
+      style: TextStyle(color: t.text, fontSize: 13.5),
+      decoration: InputDecoration(
+        hintText: hint,
+        hintStyle: TextStyle(color: t.textTertiary, fontSize: 12.5),
+        filled: true,
+        fillColor: t.bg.withValues(alpha: 0.4),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide.none,
+        ),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      ),
+    );
+  }
+
   void _showVoiceSelectionSheet() {
     final t = AppThemeColors.of(context);
+    // Each voice belongs to a mode. Premium = generative (most natural, uses
+    // more credits); Cost Saver = neural (free-tier friendly).
     final voices = [
-      {'name': 'Tiffany', 'desc': 'Warm & Professional', 'gender': 'Female'},
-      {'name': 'Ruth', 'desc': 'Sophisticated & Clear', 'gender': 'Female'},
-      {'name': 'Joanna', 'desc': 'Calm & Articulate', 'gender': 'Female'},
-      {'name': 'Matthew', 'desc': 'Clear & Authoritative', 'gender': 'Male'},
-      {'name': 'Stephen', 'desc': 'Friendly & Natural', 'gender': 'Male'},
+      {'name': 'Tiffany', 'desc': 'Most Natural, Lifelike', 'gender': 'Female', 'mode': 'premium'},
+      {'name': 'Ruth', 'desc': 'Warm & Professional', 'gender': 'Female', 'mode': 'cost_saver'},
+      {'name': 'Joanna', 'desc': 'Calm & Articulate', 'gender': 'Female', 'mode': 'cost_saver'},
+      {'name': 'Matthew', 'desc': 'Clear & Authoritative', 'gender': 'Male', 'mode': 'cost_saver'},
+      {'name': 'Stephen', 'desc': 'Friendly & Natural', 'gender': 'Male', 'mode': 'cost_saver'},
     ];
 
     showModalBottomSheet(
@@ -330,102 +547,188 @@ class _ProfileScreenState extends State<ProfileScreen> {
       backgroundColor: Colors.transparent,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setModalState) => Consumer<AuthProvider>(
-          builder: (context, auth, _) => GlassCard(
-            borderRadius: 32,
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text('Select Voice Model', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: t.text)),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: t.primary.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(8),
+          builder: (context, auth, _) {
+            final mode = auth.voiceMode;
+            final visibleVoices = voices.where((v) => v['mode'] == mode).toList();
+
+            Future<void> applyMode(String newMode) async {
+              if (newMode == auth.voiceMode) return;
+              // Switching mode also snaps the selected voice to a valid one for
+              // that mode, so voiceId and voiceMode never disagree.
+              final defaultVoice = newMode == 'premium' ? 'Tiffany' : 'Ruth';
+              final stillValid = voices.any((v) => v['name'] == auth.voiceId && v['mode'] == newMode);
+              try {
+                await auth.updateUserProfile(
+                  voiceMode: newMode,
+                  voiceId: stillValid ? auth.voiceId : defaultVoice,
+                );
+                if (context.mounted) {
+                  Notify.success(context,
+                      newMode == 'premium' ? "Premium voices enabled" : "Cost Saver voices enabled");
+                }
+              } catch (e) {
+                if (context.mounted) Notify.error(context, "Failed to update voice mode");
+              }
+              if (mounted) setModalState(() {});
+            }
+
+            return GlassCard(
+              borderRadius: 32,
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('Voice Model', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: t.text)),
+                  const SizedBox(height: 4),
+                  Text('Choose a voice mode, then pick a persona.', style: TextStyle(fontSize: 11, color: t.textTertiary)),
+                  const SizedBox(height: 16),
+
+                  // ---- MODE TOGGLE ----
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _voiceModeChip(
+                          t,
+                          title: 'Cost Saver',
+                          subtitle: 'Neural • Free-tier',
+                          icon: FeatherIcons.feather,
+                          active: mode == 'cost_saver',
+                          onTap: () => applyMode('cost_saver'),
+                        ),
                       ),
-                      child: Text('Generative', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: t.primary, letterSpacing: 0.5)),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Text('Powered by Amazon Polly Generative AI', style: TextStyle(fontSize: 11, color: t.textTertiary)),
-                const SizedBox(height: 20),
-                
-                // Scrollable list of voices
-                ConstrainedBox(
-                  constraints: BoxConstraints(
-                    maxHeight: MediaQuery.of(context).size.height * 0.5,
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _voiceModeChip(
+                          t,
+                          title: 'Premium',
+                          subtitle: 'Generative • Lifelike',
+                          icon: FeatherIcons.zap,
+                          active: mode == 'premium',
+                          onTap: () => applyMode('premium'),
+                        ),
+                      ),
+                    ],
                   ),
-                  child: SingleChildScrollView(
-                    child: Column(
-                      children: voices.map((v) {
-                        final isSelected = auth.voiceId == v['name'];
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 12.0),
-                          child: GlassCard(
-                            borderRadius: 16,
-                            padding: const EdgeInsets.all(16),
-                            tintColor: isSelected ? t.primary.withValues(alpha: 0.1) : null,
-                            hasMetallicBorder: isSelected,
-                            onTap: () async {
-                              try {
-                                final selectedVoice = v['name']!;
-                                await auth.updateUserProfile(voiceId: selectedVoice);
-                                if (context.mounted) {
-                                  Notify.success(context, "Voice model updated to $selectedVoice");
+                  const SizedBox(height: 18),
+
+                  // ---- VOICES FOR THE ACTIVE MODE ----
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.of(context).size.height * 0.42,
+                    ),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        children: visibleVoices.map((v) {
+                          final isSelected = auth.voiceId == v['name'];
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 12.0),
+                            child: GlassCard(
+                              borderRadius: 16,
+                              padding: const EdgeInsets.all(16),
+                              tintColor: isSelected ? t.primary.withValues(alpha: 0.1) : null,
+                              hasMetallicBorder: isSelected,
+                              onTap: () async {
+                                try {
+                                  final selectedVoice = v['name']!;
+                                  await auth.updateUserProfile(
+                                    voiceId: selectedVoice,
+                                    voiceMode: v['mode'],
+                                  );
+                                  if (context.mounted) {
+                                    Notify.success(context, "Voice updated to $selectedVoice");
+                                  }
+                                } catch (e) {
+                                  if (context.mounted) {
+                                    Notify.error(context, "Failed to update voice model");
+                                  }
                                 }
-                              } catch (e) {
-                                if (context.mounted) {
-                                  Notify.error(context, "Failed to update voice model");
-                                }
-                              }
-                              if (mounted) setModalState(() {});
-                            },
-                            child: Row(
-                              children: [
-                                Container(
-                                  width: 40, height: 40,
-                                  decoration: BoxDecoration(
-                                    color: isSelected ? t.primary : t.bgSecondary,
-                                    borderRadius: BorderRadius.circular(12),
+                                if (mounted) setModalState(() {});
+                              },
+                              child: Row(
+                                children: [
+                                  Container(
+                                    width: 40, height: 40,
+                                    decoration: BoxDecoration(
+                                      color: isSelected ? t.primary : t.bgSecondary,
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                    child: Icon(
+                                      isSelected ? FeatherIcons.check : FeatherIcons.user,
+                                      size: 18,
+                                      color: isSelected ? Colors.white : t.textSecondary,
+                                    ),
                                   ),
-                                  child: Icon(
-                                    isSelected ? FeatherIcons.check : FeatherIcons.user,
-                                    size: 18,
-                                    color: isSelected ? Colors.white : t.textSecondary,
+                                  const SizedBox(width: 16),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(v['name']!, style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: t.text)),
+                                        Text(v['desc']!, style: TextStyle(fontSize: 12, color: t.textTertiary)),
+                                      ],
+                                    ),
                                   ),
-                                ),
-                                const SizedBox(width: 16),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(v['name']!, style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: t.text)),
-                                      Text(v['desc']!, style: TextStyle(fontSize: 12, color: t.textTertiary)),
-                                    ],
+                                  IconButton(
+                                    onPressed: () => _playPreview(v['name']!),
+                                    icon: Icon(FeatherIcons.playCircle, color: t.primary),
+                                    tooltip: 'Preview Voice',
                                   ),
-                                ),
-                                IconButton(
-                                  onPressed: () => _playPreview(v['name']!),
-                                  icon: Icon(FeatherIcons.playCircle, color: t.primary),
-                                  tooltip: 'Preview Voice',
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
-                          ),
-                        );
-                      }).toList(),
+                          );
+                        }).toList(),
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(height: 12),
+                  const SizedBox(height: 12),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _voiceModeChip(
+    AppThemeColors t, {
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required bool active,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 12),
+        decoration: BoxDecoration(
+          color: active ? t.primary.withValues(alpha: 0.16) : t.bg.withValues(alpha: 0.4),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: active ? t.primary : t.metallicBorder.withValues(alpha: 0.3),
+            width: active ? 1.5 : 1,
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(icon, size: 15, color: active ? t.primary : t.textSecondary),
+                const SizedBox(width: 6),
+                Text(title,
+                    style: TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.bold,
+                        color: active ? t.primary : t.text)),
               ],
             ),
-          ),
+            const SizedBox(height: 3),
+            Text(subtitle, style: TextStyle(fontSize: 10.5, color: t.textTertiary)),
+          ],
         ),
       ),
     );
@@ -950,7 +1253,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         label: "Voice Model",
                         iconColor: t.primary,
                         iconBg: t.primary.withValues(alpha: 0.1),
-                        right: Text(auth.voiceId, style: TextStyle(fontSize: 13, color: t.textSecondary)),
+                        right: Text(
+                            "${auth.voiceId} · ${auth.isPremiumVoice ? 'Premium' : 'Cost Saver'}",
+                            style: TextStyle(fontSize: 13, color: t.textSecondary)),
                         onPress: _showVoiceSelectionSheet,
                       ),
                     ],
@@ -980,11 +1285,19 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       ),
                       const ProfileDiv(),
                       SettingRow(
+                        icon: FeatherIcons.droplet,
+                        label: 'Appearance',
+                        iconColor: t.primary,
+                        iconBg: t.primary.withValues(alpha: 0.15),
+                        onPress: _showAppearanceSheet,
+                      ),
+                      const ProfileDiv(),
+                      SettingRow(
                         icon: FeatherIcons.lock,
                         label: 'Change Password',
                         iconColor: t.warning,
                         iconBg: t.warning.withValues(alpha: 0.15),
-                        onPress: () => Notify.info(context, 'Opening secure password session...'),
+                        onPress: _showChangePasswordDialog,
                       ),
                     ],
                   ),

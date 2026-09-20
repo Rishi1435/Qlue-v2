@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../core/models/dashboard_model.dart';
 import '../core/models/session_model.dart';
@@ -18,18 +20,39 @@ class DashboardProvider extends ChangeNotifier {
   bool _isLoading = false;
   bool get isLoading => _isLoading;
 
+  // STARTUP FLASH FIX: before the first fetch completes, neither the stat
+  // cards nor the empty state should render (defaults flashed for a moment
+  // and vanished). Screens gate on this instead of guessing.
+  bool _hasLoadedOnce = false;
+  bool get hasLoadedOnce => _hasLoadedOnce;
+
   String? _error;
   String? get error => _error;
+
+  // REALTIME REFRESH: keeps dashboard/history data current without the user
+  // switching screens. Silent fetches never toggle isLoading (no spinner or
+  // empty-state flicker) and keep the last good data on transient errors.
+  Timer? _autoRefreshTimer;
+  DateTime? _lastFetchedAt;
+  bool _fetchInFlight = false;
+  static const Duration autoRefreshInterval = Duration(seconds: 45);
+  static const Duration _minRefreshGap = Duration(seconds: 10);
+
+  bool get isAutoRefreshing => _autoRefreshTimer != null;
 
   void _setLoading(bool value) {
     _isLoading = value;
     notifyListeners();
   }
 
-  Future<void> fetchDashboardData() async {
+  Future<void> fetchDashboardData({bool silent = false}) async {
+    if (_fetchInFlight) return; // never stack overlapping fetches
+    _fetchInFlight = true;
     try {
-      _setLoading(true);
-      _error = null;
+      if (!silent) {
+        _setLoading(true);
+        _error = null;
+      }
 
       // Fetch sumary, stats and history in parallel
       final results = await Future.wait([
@@ -41,12 +64,50 @@ class DashboardProvider extends ChangeNotifier {
       _summary = results[0] as DashboardSummary;
       _radarData = results[1] as RadarData;
       _history = results[2] as List<SessionModel>;
+      _lastFetchedAt = DateTime.now();
+      _hasLoadedOnce = true;
+      _error = null;
 
+      if (silent) notifyListeners(); // non-silent path notifies via _setLoading
     } catch (e) {
-      _error = "Failed to load dashboard data.";
+      if (!silent) {
+        _error = "Failed to load dashboard data.";
+      }
+      // Silent refresh failures keep showing the last good data.
     } finally {
-      _setLoading(false);
+      _fetchInFlight = false;
+      if (!silent) _setLoading(false);
     }
+  }
+
+  /// Immediate silent refresh, throttled so rapid tab switches don't spam
+  /// the backend (and the AWS bill).
+  Future<void> refreshNow() async {
+    final last = _lastFetchedAt;
+    if (last != null && DateTime.now().difference(last) < _minRefreshGap) {
+      return;
+    }
+    await fetchDashboardData(silent: true);
+  }
+
+  /// Starts periodic background refresh. Idempotent.
+  void startAutoRefresh() {
+    if (_autoRefreshTimer != null) return;
+    _autoRefreshTimer = Timer.periodic(
+      autoRefreshInterval,
+      (_) => fetchDashboardData(silent: true),
+    );
+  }
+
+  void stopAutoRefresh() {
+    _autoRefreshTimer?.cancel();
+    _autoRefreshTimer = null;
+  }
+
+  @override
+  void dispose() {
+    stopAutoRefresh();
+    super.dispose();
   }
 
   Future<void> fetchHistory({String? moduleType}) async {

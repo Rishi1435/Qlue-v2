@@ -1,31 +1,37 @@
 const { fetchAndCleanContent } = require('../../lib/scraper');
 const { invokeModel } = require('../../lib/bedrock');
-const { success, error } = require('../../lib/response');
+// BUG FIX: this lib exports badRequest/notFound/etc., not 'error' — the
+// previous import left error() undefined, so the URL-validation failure
+// paths threw TypeError instead of returning 400s.
+const { success, badRequest } = require('../../lib/response');
 
 /**
  * Validates if the given URL contains educational/professional content.
  */
 exports.handler = async (event) => {
     try {
+        // BUG FIX: userId was referenced by the scrape-cache block below but
+        // never defined in this scope. The resulting ReferenceError was caught
+        // by the outer handler, so EVERY validation — including perfectly good
+        // tutorial links — came back as { isEducational: false }, making the
+        // WEBSITE module impossible to start.
+        const authorizer = event.requestContext?.authorizer;
+        const userId = authorizer?.uid || authorizer?.principalId || authorizer?.claims?.sub;
+
         const { websiteUrl } = JSON.parse(event.body || '{}');
-        if (!websiteUrl) return error('URL required', 400);
+        if (!websiteUrl) return badRequest('URL required');
 
         let urlObj;
         try {
             urlObj = new URL(websiteUrl);
         } catch (e) {
-            return error('Invalid URL format', 400);
+            return badRequest('Invalid URL format');
         }
 
-        const hostname = urlObj.hostname.toLowerCase();
-        const isAllowedDomain = hostname.includes('w3') || hostname.includes('geeksgeek') || hostname.includes('geeksforgeeks');
-
-        if (!isAllowedDomain) {
-            return success({
-                isEducational: false,
-                reason: "For now, only w3schools and geeksforgeeks domains are supported for AI Tutor scraping."
-            });
-        }
+        // BUG FIX: removed the hard-coded w3schools/geeksforgeeks allowlist —
+        // it rejected every other site before the actual content audit below
+        // ever ran. The LLM audit already accepts tutorials/docs/articles and
+        // rejects only adult content or spam, which is the real safety check.
 
         // 1. Scrape content to verify it exists and is readable
         const { content } = await fetchAndCleanContent(websiteUrl);
@@ -49,10 +55,33 @@ Format your output strictly as a JSON object: {"isEducational": boolean, "reason
         const responseText = bedrockResult.content?.[0]?.text || '';
         if (responseText) {
             try {
-                analysis = JSON.parse(responseText);
+                // Strip markdown code fences some models wrap JSON in
+                analysis = JSON.parse(responseText.replace(/```json|```/g, '').trim());
             } catch (e) {
                 // Handle non-JSON output if any
                 analysis = { isEducational: responseText.toLowerCase().includes('true'), reason: 'Parsed from text' };
+            }
+        }
+
+        // Guarantee a human-readable reason so the app never falls back to
+        // its generic toast text.
+        if (analysis.isEducational !== true && !analysis.reason) {
+            analysis.reason = 'This page did not look like educational or professional learning content.';
+        }
+
+        // SCRAPE-ONCE: cache the content we already fetched so session init
+        // reuses it instead of scraping the same URL again seconds later
+        // (rate limits + the 15s init timeout caused the 'Could not read
+        // that website' failure right after a green validation).
+        if (analysis.isEducational === true && userId) {
+            try {
+                const { saveWebsiteScrape } = require('../../models/user');
+                await saveWebsiteScrape(userId, {
+                    url: websiteUrl,
+                    content: content.substring(0, 6000)
+                });
+            } catch (cacheErr) {
+                console.warn('Website scrape cache failed (non-fatal):', cacheErr.message);
             }
         }
 

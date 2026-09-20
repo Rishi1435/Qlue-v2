@@ -361,7 +361,9 @@ class _AIModulesScreenState extends State<AIModulesScreen>
 
   Widget _buildInterviewList(AppThemeColors t) {
     return ListView(
-      padding: const EdgeInsets.all(24),
+      // Bottom inset clears the floating nav bar so the last module's
+      // Start Practice button is always tappable.
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 140),
       children: [
         _buildModuleCard(
           t,
@@ -396,6 +398,16 @@ class _AIModulesScreenState extends State<AIModulesScreen>
           "HR",
           "assets/images/hr.png",
           onStartTap: () => context.push('/interview/session/new?moduleType=HR'),
+        ),
+        const SizedBox(height: 24),
+        _buildModuleCard(
+          t,
+          "Job Match",
+          "Get a profile match score for any job posting, then practice an interview tailored to that exact role.",
+          "Link or pasted JD + your resume",
+          "JD",
+          "assets/images/Resume.png",
+          onStartTap: () => context.push('/job-match'),
         ),
       ],
     );
@@ -454,13 +466,18 @@ class _AIModulesScreenState extends State<AIModulesScreen>
                 data: {'websiteUrl': url},
               );
 
-              if (response.data['isEducational'] == true) {
+              // Backend wraps payloads as { success, data: {...} }
+              final result = (response.data is Map && response.data['data'] is Map)
+                  ? response.data['data']
+                  : response.data;
+
+              if (result['isEducational'] == true) {
                 if (mounted) {
                   context.push('/interview/session/new?moduleType=WEBSITE&websiteUrl=${Uri.encodeComponent(url)}');
                 }
               } else {
                 if (mounted) {
-                  Notify.error(context, response.data['reason'] ?? "This website does not contain educational content.");
+                  Notify.error(context, result['reason'] ?? "This website does not contain educational content.");
                 }
               }
             } catch (e) {
@@ -495,6 +512,7 @@ class _AIModulesScreenState extends State<AIModulesScreen>
     VoidCallback? onStartTap,
     Widget? featureWidget,
     bool isLoading = false,
+    double height = 220,
   }) {
     Color glowColor;
     switch (tag.toLowerCase()) {
@@ -521,7 +539,7 @@ class _AIModulesScreenState extends State<AIModulesScreen>
       padding: const EdgeInsets.all(24),
       margin: const EdgeInsets.only(bottom: 20),
       child: SizedBox(
-        height: 220, // Fixed internal height for synchronization
+        height: height,
         child: Row(
           children: [
             Expanded(

@@ -244,6 +244,30 @@ class _HistoryScreenState extends State<HistoryScreen> {
                 ),
               ),
             ),
+            // EMPTY STATE: new users see a prompt instead of a blank
+            // timeline. With interview data, the original design renders.
+            if (!dashboard.hasLoadedOnce)
+              SliverFillRemaining(
+                hasScrollBody: false,
+                child: Center(
+                  child: CircularProgressIndicator(strokeWidth: 2.5, color: t.primary),
+                ),
+              )
+            else if (dashboard.isLoading && dashboard.history.isEmpty)
+              // A fetch is in flight — never flash the empty state while the
+              // full history is loading.
+              SliverFillRemaining(
+                hasScrollBody: false,
+                child: Center(
+                  child: CircularProgressIndicator(strokeWidth: 2.5, color: t.primary),
+                ),
+              )
+            else if (dashboard.history.isEmpty)
+              SliverFillRemaining(
+                hasScrollBody: false,
+                child: _buildEmptyState(t),
+              )
+            else ...[
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 24),
@@ -282,7 +306,73 @@ class _HistoryScreenState extends State<HistoryScreen> {
                 childCount: sessions.length,
               )),
             ),
+            ],
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyState(AppThemeColors t) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 24, right: 24, bottom: 120),
+      child: Center(
+        child: GlassCard(
+          hasMetallicBorder: true,
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 40),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 72,
+                height: 72,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: t.primary.withValues(alpha: 0.1),
+                  border: Border.all(color: t.primary.withValues(alpha: 0.25)),
+                ),
+                child: Center(child: Icon(FeatherIcons.clock, size: 30, color: t.primary)),
+              ),
+              const SizedBox(height: 24),
+              Text(
+                "No Interviews Yet",
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w900,
+                  color: t.text,
+                  letterSpacing: -0.5,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                "Attend an interview to view your\npractice history here.",
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 13, color: t.textSecondary, height: 1.5),
+              ),
+              const SizedBox(height: 28),
+              GestureDetector(
+                onTap: () => context.go('/practice'),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 14),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(colors: t.primaryGradient),
+                    borderRadius: BorderRadius.circular(16),
+                    boxShadow: [
+                      BoxShadow(
+                        color: t.primaryGradient.last.withValues(alpha: 0.35),
+                        blurRadius: 18,
+                        offset: const Offset(0, 6),
+                      ),
+                    ],
+                  ),
+                  child: const Text(
+                    "Start an Interview",
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

@@ -12,8 +12,8 @@ import 'screens/tabs/profile_screen.dart';
 import 'screens/interview/interview_session_screen.dart';
 import 'screens/resume/resume_upload_screen.dart';
 import 'screens/resume/resume_detail_screen.dart';
-import 'context/dashboard_provider.dart';
 import 'core/models/session_model.dart';
+import 'screens/interview/job_match_screen.dart';
 
 CustomTransitionPage _buildSlideTransitionPage({
   required GoRouterState state,
@@ -188,6 +188,10 @@ GoRouter buildAppRouter(AuthProvider authProvider) {
       GoRoute(
         path: '/profile',
         builder: (context, state) => const ProfileScreen(),
+      ),
+      GoRoute(
+        path: '/job-match',
+        builder: (context, state) => const JobMatchScreen(),
       ),
       GoRoute(
         path: '/interview/session/:sessionId',

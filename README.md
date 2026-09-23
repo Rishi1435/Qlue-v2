@@ -51,6 +51,7 @@ The system supports **four distinct AI-driven interview modules**:
 | **HR** | Behavioural interview using STAR-framework questions |
 | **INTRO** | Self-introduction coaching for perfecting the "tell me about yourself" pitch |
 | **WEBSITE** | Adaptive tutoring from any web URL — user shares a link and is quizzed on its content |
+| **JOB MATCH (JD)** | Analyze a job posting against a selected resume to produce a profile match score and tailored JD interview |
 
 Every spoken response is transcribed (via `speech_to_text`), sent to the backend, scored by Bedrock, and the AI's reply is synthesised by **Amazon Polly** (5 selectable voice personas) and played back to the candidate in real time via `just_audio`.
 
@@ -197,6 +198,26 @@ Every spoken response is transcribed (via `speech_to_text`), sent to the backend
 - `buildWebsiteTeachPrompt()` constructs adaptive tutoring prompts per concept
 - Concept mastery tracked in `qlue-concept-states` table (PENDING → TUTORED → MASTERED)
 - Scored on: `comprehensionAccuracy`, `learningProgression`, `criticalThinking`, `responseClarity`, `conceptRetention`
+
+### 5. JOB MATCH Module
+- Purpose: compare a candidate's selected resume against a job posting and produce a profile `matchScore` (0–100), a condensed `jdSummary`, matched/missing skills, and a short `verdict` to inform a JD-tailored practice interview.
+- Inputs: job posting supplied as a **link**, **pasted text**, or an **uploaded PDF** (Textract-parsed). The frontend offers an upload presign flow for PDFs.
+- Backend handler: `POST /jd/analyze` implemented at [backend/src/handlers/jd/analyzeJobMatch.js](backend/src/handlers/jd/analyzeJobMatch.js#L1).
+- Key behaviour:
+    - Validates resume ownership via `getResumeById` before analysis.
+    - Obtains JD text from (priority): uploaded PDF → pasted text → scraped page (`fetchAndCleanContent`).
+    - Sends a structured system prompt to the LLM which must return a strict JSON object with `isJobPosting`, `matchScore`, `roleTitle`, `matchedSkills`, `missingSkills`, `verdict`, and `jdSummary`.
+    - Persists a compact JD analysis on the user record via `saveJdAnalysis` so that `initializeSession` can seed the JD interview module without re-scraping.
+- Frontend: UI implemented at [frontend/lib/screens/interview/job_match_screen.dart](frontend/lib/screens/interview/job_match_screen.dart#L1). The screen supports switching between Link / PDF / Paste inputs, uploads PDFs via a presigned S3 PUT, and displays results with a semicircle gauge.
+- Threshold & session integration:
+    - Environment variable `JD_MATCH_THRESHOLD` (default `60`) controls eligibility to unlock a JD-tailored practice interview.
+    - `initializeSession` accepts `moduleType=JD` and requires a prior job-match analysis; it injects `jdSummary`, `jdRoleTitle`, and `jdMatchScore` into the session payload ([backend/src/handlers/interview/initializeSession.js](backend/src/handlers/interview/initializeSession.js#L110)).
+- Security & UX notes:
+    - Uploaded PDF S3 keys are namespaced under `jd/<userId>/...`; the handler enforces ownership of the key before running Textract.
+    - Scraping may fail on protected sites (LinkedIn etc.) — the endpoint signals `canPasteText` to prompt the client to accept pasted JD text.
+- Infra & tests:
+    - Lambda: `AnalyzeJobMatchFunction` defined in [backend/template.yaml](backend/template.yaml#L1540) with a longer `Timeout` (90s) to accommodate scraping + LLM latency.
+    - Unit tests covering the JD analysis handler: [backend/tests/unit/analyzeJobMatch.test.js](backend/tests/unit/analyzeJobMatch.test.js#L1).
 
 ### Session Lifecycle & State Machine
 

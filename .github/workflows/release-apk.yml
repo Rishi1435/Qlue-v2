@@ -1,0 +1,126 @@
+name: Release Android APK
+
+# Cut a release by pushing a version tag, for example:
+#   git tag v1.0.0 && git push origin v1.0.0
+# This builds the release APK and publishes it to GitHub Releases as Qlue.apk.
+# Everything (release tag, name, notes) is derived from the pushed tag.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Lets softprops/action-gh-release create the release and upload the asset
+# using the built-in GITHUB_TOKEN. No external secrets are needed to publish.
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # The Flutter project lives in frontend/, not the repo root, so every
+        # `run` step executes there. (`uses:` steps below use repo-root paths.)
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # Pinned to the toolchain the app is built/verified with locally
+          # (Dart 3.11.0 satisfies pubspec's `sdk: ^3.11.0`). Bump when you
+          # upgrade Flutter; drop `flutter-version` to always take latest stable.
+          flutter-version: 3.41.2
+          channel: stable
+          cache: true
+
+      - name: Write google-services.json from secret
+        # The Firebase (com.google.gms.google-services) Gradle plugin hard-fails
+        # if this file is missing, and it is gitignored, so materialize it from
+        # a repository secret (base64 of frontend/android/app/google-services.json).
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -z "$GOOGLE_SERVICES_JSON" ]; then
+            echo "::error::Repository secret GOOGLE_SERVICES_JSON is not set. Base64-encode frontend/android/app/google-services.json and add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          printf '%s' "$GOOGLE_SERVICES_JSON" | base64 --decode > android/app/google-services.json
+          echo "Wrote android/app/google-services.json"
+
+      - name: Write env.json from secret
+        # The app reads its config at COMPILE time via --dart-define-from-file=env.json
+        # (see lib/core/env.dart; Env.validate() hard-fails at launch if it is missing).
+        # env.json is not committed, so materialize it from a repository secret
+        # (base64 of frontend/env.json).
+        env:
+          ENV_JSON: ${{ secrets.ENV_JSON }}
+        run: |
+          if [ -z "$ENV_JSON" ]; then
+            echo "::error::Repository secret ENV_JSON is not set. Base64-encode frontend/env.json and add it as an Actions secret."
+            exit 1
+          fi
+          printf '%s' "$ENV_JSON" | base64 --decode > env.json
+          echo "Wrote env.json"
+
+      - name: Write release keystore from secrets
+        # Stable release signing. Without these secrets the build falls back to
+        # the ephemeral CI debug keystore (see app/build.gradle.kts), whose SHA-1
+        # changes every run — so Google Sign-In can't be registered against it and
+        # users can't update in place. Provide ANDROID_KEYSTORE_BASE64 (base64 of
+        # frontend/android/upload-keystore.jks) and ANDROID_KEYSTORE_PASSWORD as
+        # repository secrets to sign the release for real.
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            echo "::warning::Keystore secrets not set — release will be DEBUG-signed and Google Sign-In will fail. Add ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD under Settings -> Secrets and variables -> Actions."
+            exit 0
+          fi
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/upload-keystore.jks
+          printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=upload\nstoreFile=../upload-keystore.jks\n' "$ANDROID_KEYSTORE_PASSWORD" "$ANDROID_KEYSTORE_PASSWORD" > android/key.properties
+          echo "Wrote android/upload-keystore.jks and android/key.properties"
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build release APK
+        # Derive the app version from the pushed tag (v1.0.2 -> build-name 1.0.2)
+        # so the version shown in-app (via package_info_plus) tracks the release
+        # instead of pubspec's static 1.0.0+1. --build-number must be an integer,
+        # so we use the workflow run number (monotonic per repo) as versionCode.
+        # --dart-define-from-file=env.json injects the compile-time config the app
+        # requires (resolved relative to frontend/, this job's working-directory).
+        # Signing: uses the stable upload keystore when the keystore step above
+        # wrote key.properties; otherwise Gradle falls back to the debug keystore.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          flutter build apk --release \
+            --dart-define-from-file=env.json \
+            --build-name="$VERSION" \
+            --build-number="${{ github.run_number }}"
+          echo "Built app version $VERSION (versionCode ${{ github.run_number }})"
+
+      - name: Rename APK to Qlue.apk
+        run: cp build/app/outputs/flutter-apk/app-release.apk build/app/outputs/flutter-apk/Qlue.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        # Triggered by a tag push, so the release is created for that tag
+        # (github.ref_name, e.g. v1.0.0) with auto-generated notes. GITHUB_TOKEN
+        # is used automatically. Path is relative to the repo root.
+        with:
+          files: frontend/build/app/outputs/flutter-apk/Qlue.apk
+          generate_release_notes: true
+          fail_on_unmatched_files: true
